@@ -6,20 +6,43 @@
 
 ## Installing requirements
 
+Python 3.11. No `apt-get` packages are needed.
+
 ```sh
 pip install -r requirements.txt
 ```
 
+On Linux this installs the CUDA 12 build of PyTorch and TensorRT 10 (from the PyTorch and NVIDIA package indexes listed in `requirements.txt`).
+
 ## Preparatory Commands
+
+Run once, from the repository root, on the machine that will run `run.py` (needs internet and the NVIDIA GPU):
 
 ```sh
 hf download hf://Ultralytics/YOLO11@bee92e2/yolo11l.pt --local-dir yolo
+python build_engine.py
 ```
+
+`build_engine.py` exports `yolo/yolo11l.pt` to a TensorRT FP16 engine at `yolo/yolo11l.engine`. TensorRT engines only work on the GPU model and TensorRT version they were built with, so build it on the target machine. The engine has dynamic input shapes so frames get the same minimal letterbox as the `.pt` model, and a max batch of `BATCH_SIZE` from `run.py`.
 
 ## Running the Model
 
 ```sh
 python run.py --input <folder of .parquet files> --output results.jsonl
+```
+
+On CUDA, `run.py` uses `yolo/yolo11l.engine` if it exists, otherwise `yolo/yolo11l.pt` (FP16). Elsewhere it uses `yolo/yolo11l.pt` in FP32. `--model <file>` overrides this.
+
+Development options: `--max-files N`, `--max-rows N` (videos per file), `--dev` (one video) and `--fp32` (no FP16 for the `.pt` model on CUDA).
+
+## Checking Correctness
+
+`compare.py` scores a results file against a reference with the three checks below. To check the engine against full-precision PyTorch:
+
+```sh
+python run.py --input <folder> --output reference.jsonl --model yolo/yolo11l.pt --fp32 --max-rows 5
+python run.py --input <folder> --output engine.jsonl --max-rows 5
+python compare.py reference.jsonl engine.jsonl
 ```
 
 ## Output Format

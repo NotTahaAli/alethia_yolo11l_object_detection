@@ -81,8 +81,9 @@ def default_model(device: str) -> str:
 
 
 class Predictor:
-    def __init__(self, model_file: str, device: str):
+    def __init__(self, model_file: str, device: str, fp16: bool):
         self.device = device
+        self.fp16 = fp16
         self.model = YOLO(model_file, task="detect")
         names: dict[int, str] = self.model.names
         name_to_id = {name: class_id for class_id, name in names.items()}
@@ -98,7 +99,7 @@ class Predictor:
                                      imgsz=MODEL_INPUT_SIZE,
                                      conf=MODEL_CONFIDENCE_THRESHOLD,
                                      classes=self.class_ids,
-                                     quantize=16 if self.device == "0" else None,  # FP16 on CUDA only
+                                     quantize=16 if self.fp16 else None,  # .pt only; an engine has its own precision
                                      verbose=False,
                                      device=self.device)
         detections: list[tuple[set[str], int]] = []
@@ -287,14 +288,16 @@ def main() -> None:
     parser.add_argument("--max-files", type=int, default=0, help="Only process this many parquet files (0 = all)")
     parser.add_argument("--max-rows", type=int, default=0, help="Only process this many videos per file (0 = all)")
     parser.add_argument("--dev", action="store_true", help="Shortcut for --max-files 1 --max-rows 1")
+    parser.add_argument("--fp32", action="store_true", help="Run a .pt model in FP32 on CUDA (default FP16), e.g. for a reference")
     args = parser.parse_args()
     if args.dev:
         args.max_files, args.max_rows = 1, 1
 
     device = pick_device()
     model_file: str = args.model or default_model(device)
-    print(f"Using {model_file} on device {device}")
-    predictor = Predictor(model_file, device)
+    fp16 = device == "0" and not args.fp32
+    print(f"Using {model_file} on device {device}{' (FP16)' if fp16 else ''}")
+    predictor = Predictor(model_file, device, fp16)
     run(get_parquet_files(args.input, args.max_files), args.output, predictor, args.max_rows)
 
 
