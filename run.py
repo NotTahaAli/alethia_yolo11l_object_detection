@@ -132,8 +132,9 @@ class Predictor:
             self.model_file = "CoreML"
             model = self._model_for(letterbox(360, 640).padded)  # the most common shape; exported on first run
         else:
-            self.model_file = model_file or (ENGINE_MODEL_FILE if backend == "cuda" and os.path.exists(ENGINE_MODEL_FILE)
-                                             else PT_MODEL_FILE)
+            # The TensorRT engine is opt-in (--model yolo/yolo11l.engine): on a Kaggle T4 its detections were wrong
+            # (object F1 0.02 against FP32), so the default stays the verified .pt model.
+            self.model_file = model_file or PT_MODEL_FILE
             model = self.model = self._load(self.model_file)
         names: dict[int, str] = model.names
         name_to_id = {name: class_id for class_id, name in names.items()}
@@ -628,8 +629,8 @@ def main() -> None:
     parser.add_argument("--output", default="results.jsonl", help="jsonl file to write the results to")
     parser.add_argument("--workers", help="Comma-separated backend per worker process, from "
                         f"{', '.join(BACKENDS)} (default: cuda,cuda on NVIDIA, mps,mps,coreml,coreml on Apple Silicon)")
-    parser.add_argument("--model", help=f"Model file for cuda/mps/cpu workers (default: {ENGINE_MODEL_FILE} on CUDA "
-                        f"if built, else {PT_MODEL_FILE})")
+    parser.add_argument("--model", help=f"Model file for cuda/mps/cpu workers (default: {PT_MODEL_FILE}; "
+                        f"{ENGINE_MODEL_FILE} is experimental)")
     parser.add_argument("--max-files", type=int, default=0, help="Only process this many parquet files (0 = all)")
     parser.add_argument("--max-rows", type=int, default=0, help="Only process this many videos per file (0 = all)")
     parser.add_argument("--sample-rows", type=int, default=0,

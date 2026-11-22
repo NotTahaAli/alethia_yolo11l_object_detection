@@ -276,7 +276,20 @@ Raw model, batch 64 at 384x640, FP16:
 
 **Rejected:** both slower on MPS, and both change the model's numbers.
 
-## 21. Considered and not done
+## 21. TensorRT engine on a Kaggle T4 — wrong detections
+
+5 videos (1,541 seconds), Kaggle T4:
+
+| Run | Time | vs FP32 reference |
+|---|---|---|
+| FP32 PyTorch reference | 1,016 s | |
+| TensorRT FP16 engine (step 15 build) | 198 s (5.1x faster) | object F1 **0.018**, people exact 0.42 — FAIL |
+
+The engine found a person in 11 seconds where the reference found 897; it is effectively detecting nothing, which
+points at its input or build rather than FP16 rounding. Not yet diagnosed. **Rolled back:** the engine is now opt-in
+(`--model yolo/yolo11l.engine`), the preparation command no longer builds it, and CUDA defaults to `yolo11l.pt` in FP16.
+
+## 22. Considered and not done
 
 | Idea | Why not |
 |---|---|

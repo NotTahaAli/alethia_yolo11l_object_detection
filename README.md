@@ -3,7 +3,7 @@
 For every second of every video in a folder of [FineVideo](https://huggingface.co/datasets/HuggingFaceFV/finevideo)
 Parquet files, `run.py` records which of five objects (person, car, dog, laptop, cell phone) appear and how many
 people are visible, using Ultralytics YOLO11l ([`yolo11l.pt`](https://huggingface.co/Ultralytics/YOLO11/blob/main/yolo11l.pt)).
-It runs on NVIDIA GPUs (TensorRT or PyTorch), on Apple Silicon (GPU and Neural Engine together) and on CPU.
+It runs on NVIDIA GPUs (PyTorch FP16), on Apple Silicon (GPU and Neural Engine together) and on CPU.
 The assignment is described in `AI_Engineering_TakeHome_Brief.pdf`.
 
 ## Setup
@@ -22,13 +22,10 @@ listed at the top of `requirements.txt`. On macOS it installs the standard PyTor
 Run once from the repository root, with internet access, on the machine that will run `run.py`:
 
 ```sh
-hf download hf://Ultralytics/YOLO11@bee92e2/yolo11l.pt --local-dir yolo && python build_engine.py
+hf download hf://Ultralytics/YOLO11@bee92e2/yolo11l.pt --local-dir yolo
 ```
 
-1. `hf download` fetches the official weights to `yolo/yolo11l.pt`.
-2. `build_engine.py` (NVIDIA only) builds a TensorRT FP16 engine at `yolo/yolo11l.engine`. Engines only work on the
-   GPU model and TensorRT version that built them, so build it on the machine that runs `run.py`. On a machine without
-   CUDA it skips the build with a message, and `run.py` uses `yolo11l.pt`.
+This fetches the official weights to `yolo/yolo11l.pt`.
 
 On Apple Silicon there is nothing to build: CoreML models are exported to `yolo/coreml/` the first time each input
 shape is seen (about a minute each, then cached).
@@ -42,7 +39,7 @@ python run.py --input <folder of .parquet files> --output results.jsonl
 | Option | Effect |
 | --- | --- |
 | `--workers B,B,...` | Backend of each worker process (see below). Default `cuda,cuda` with CUDA, `mps,mps,coreml,coreml` on Apple Silicon, `cpu` otherwise |
-| `--model FILE` | Model for `cuda`, `mps` and `cpu` workers. Default `yolo/yolo11l.engine` on CUDA if built, else `yolo/yolo11l.pt` |
+| `--model FILE` | Model for `cuda`, `mps` and `cpu` workers. Default `yolo/yolo11l.pt` |
 | `--fp32` | Run `.pt` models in FP32 instead of FP16, e.g. to make a reference |
 | `--max-files N`, `--max-rows N` | Only process the first N Parquet files, or the first N videos of each file |
 | `--sample-rows N`, `--seed S` | Process N randomly chosen videos from every Parquet file; the choice depends only on the seed and file name |
@@ -50,7 +47,7 @@ python run.py --input <folder of .parquet files> --output results.jsonl
 
 | Backend | Runs | Model |
 | --- | --- | --- |
-| `cuda` | NVIDIA GPU | TensorRT FP16 engine if built, else `yolo11l.pt` in FP16 |
+| `cuda` | NVIDIA GPU | `yolo11l.pt` in FP16 |
 | `mps` | Apple GPU | `yolo11l.pt` in FP16 |
 | `coreml` | Apple Neural Engine | FP16 CoreML model per input shape |
 | `cpu` | CPU | `yolo11l.pt` in FP32 |
@@ -97,8 +94,7 @@ every change that was tried, in order, with measurements.
 - **No per-call overhead.** Padding and normalisation run on the device; the model and NMS are called directly.
 - **Overlapped work.** Decoding and resizing run in a thread alongside inference, and several worker processes keep
   the accelerator busy while others do CPU work.
-- **FP16 everywhere.** TensorRT FP16 on NVIDIA (optimised for the most common batch, 64 frames at 384x640), FP16
-  PyTorch on Apple GPUs, FP16 CoreML on the Neural Engine.
+- **FP16 everywhere.** FP16 PyTorch on NVIDIA and Apple GPUs, FP16 CoreML on the Neural Engine.
 - **Apple GPU and Neural Engine together.** They only run in parallel from separate processes, hence the
   `mps,mps,coreml,coreml` default. CoreML models are static, so there is one per letterbox shape, which keeps the
   padding identical to the `.pt` model.
@@ -115,6 +111,12 @@ python run.py --input <folder> --output reference.jsonl --workers cpu --max-rows
 python run.py --input <folder> --output fast.jsonl --max-rows 3
 python compare.py reference.jsonl fast.jsonl
 ```
+
+### TensorRT (experimental, not used by default)
+
+`python build_engine.py` builds `yolo/yolo11l.engine` (FP16, dynamic shapes), and `--model yolo/yolo11l.engine` uses
+it. On a Kaggle T4 it was about 5x faster than FP32 PyTorch but its detections were wrong (object F1 0.02 against the
+FP32 reference), so it stays opt-in until that is fixed. Check it with `compare.py` before using it.
 
 ## Output format
 
@@ -138,7 +140,7 @@ One JSON line per second of each video, in no particular order:
 | File | Purpose |
 | --- | --- |
 | `run.py` | The pipeline |
-| `build_engine.py` | Builds the TensorRT FP16 engine (preparation command) |
+| `build_engine.py` | Experimental: builds a TensorRT FP16 engine (`--model yolo/yolo11l.engine`); not used by default, see "TensorRT" above |
 | `compare.py` | Scores results against a reference |
 | `OPTIMISATION_LOG.md` | Every optimisation tried, in order, with measurements |
 | `requirements.in` | Direct dependencies; `requirements.txt` is generated from it (command at its top) |
