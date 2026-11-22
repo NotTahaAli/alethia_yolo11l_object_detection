@@ -1,87 +1,138 @@
-# YOLO11l Object Detection in HuggingFace FineVideo Dataset for Alethia AI Take Home Assignment
+# Video Indexing with YOLO11l
 
-- Dataset: `data/train-00000-of-01357.parquet` to `data/train-00001-of-01357.parquet` of [FineVideo](https://huggingface.co/datasets/HuggingFaceFV/finevideo)
-- Detection Model: Ultralytics YOLO11l specifically [yolo11l.pt](https://huggingface.co/Ultralytics/YOLO11/blob/main/yolo11l.pt), download in the preparatory commands.
-- Assignment details in AI_Engineering_TakeHome_Brief.pdf
+For every second of every video in a folder of [FineVideo](https://huggingface.co/datasets/HuggingFaceFV/finevideo)
+Parquet files, `run.py` records which of five objects (person, car, dog, laptop, cell phone) appear and how many
+people are visible, using Ultralytics YOLO11l ([`yolo11l.pt`](https://huggingface.co/Ultralytics/YOLO11/blob/main/yolo11l.pt)).
+It runs on NVIDIA GPUs (TensorRT or PyTorch), on Apple Silicon (GPU and Neural Engine together) and on CPU.
+The assignment is described in `AI_Engineering_TakeHome_Brief.pdf`.
 
-## Installing requirements
+## Setup
 
-Python 3.11. No `apt-get` packages are needed.
+Requires Python 3.11. No `apt-get` packages are needed.
 
 ```sh
 pip install -r requirements.txt
 ```
 
-On Linux this installs the CUDA 12 build of PyTorch and TensorRT 10 (from the PyTorch and NVIDIA package indexes listed in `requirements.txt`).
+On Linux this installs the CUDA 12 build of PyTorch and TensorRT 10, from the PyTorch and NVIDIA package indexes
+listed at the top of `requirements.txt`. On macOS it installs the standard PyTorch build and `coremltools`.
 
-## Preparatory Commands
+### Preparation command
 
-Run once, from the repository root, on the machine that will run `run.py` (needs internet and the NVIDIA GPU):
+Run once from the repository root, with internet access, on the machine that will run `run.py`:
 
 ```sh
-hf download hf://Ultralytics/YOLO11@bee92e2/yolo11l.pt --local-dir yolo
-python build_engine.py
+hf download hf://Ultralytics/YOLO11@bee92e2/yolo11l.pt --local-dir yolo && python build_engine.py
 ```
 
-`build_engine.py` exports `yolo/yolo11l.pt` to a TensorRT FP16 engine at `yolo/yolo11l.engine`. TensorRT engines only work on the GPU model and TensorRT version they were built with, so build it on the target machine. The engine has dynamic input shapes so frames get the same minimal letterbox as the `.pt` model, and a max batch of `BATCH_SIZE` from `run.py`.
+1. `hf download` fetches the official weights to `yolo/yolo11l.pt`.
+2. `build_engine.py` (NVIDIA only) builds a TensorRT FP16 engine at `yolo/yolo11l.engine`. Engines only work on the
+   GPU model and TensorRT version that built them, so build it on the machine that runs `run.py`. On a machine without
+   CUDA it skips the build with a message, and `run.py` uses `yolo11l.pt`.
 
-## Running the Model
+On Apple Silicon there is nothing to build: CoreML models are exported to `yolo/coreml/` the first time each input
+shape is seen (about a minute each, then cached).
+
+## Running
 
 ```sh
 python run.py --input <folder of .parquet files> --output results.jsonl
 ```
 
-`run.py` reads the Parquet files in the main process and hands each video to a pool of worker processes. Each worker
-runs one backend, decodes in a background thread and runs YOLO on batches of same-shape frames. `--workers` picks the
-backend for each worker, comma-separated:
+| Option | Effect |
+| --- | --- |
+| `--workers B,B,...` | Backend of each worker process (see below). Default `cuda,cuda` with CUDA, `mps,mps,coreml,coreml` on Apple Silicon, `cpu` otherwise |
+| `--model FILE` | Model for `cuda`, `mps` and `cpu` workers. Default `yolo/yolo11l.engine` on CUDA if built, else `yolo/yolo11l.pt` |
+| `--fp32` | Run `.pt` models in FP32 instead of FP16, e.g. to make a reference |
+| `--max-files N`, `--max-rows N` | Only process the first N Parquet files, or the first N videos of each file |
+| `--dev` | Same as `--max-files 1 --max-rows 1` |
 
-| Backend | Model | Default on |
-|---|---|---|
-| `cuda` | `yolo/yolo11l.engine` if built, else `yolo/yolo11l.pt` in FP16 | NVIDIA: `cuda,cuda` |
-| `mps` | `yolo/yolo11l.pt` in FP16 on the Apple GPU | Apple Silicon: `mps,mps,coreml,coreml` |
-| `coreml` | FP16 CoreML models on the Apple Neural Engine, one per letterboxed input shape, exported to `yolo/coreml/` on first use | |
-| `cpu` | `yolo/yolo11l.pt` in FP32 | otherwise |
+| Backend | Runs | Model |
+| --- | --- | --- |
+| `cuda` | NVIDIA GPU | TensorRT FP16 engine if built, else `yolo11l.pt` in FP16 |
+| `mps` | Apple GPU | `yolo11l.pt` in FP16 |
+| `coreml` | Apple Neural Engine | FP16 CoreML model per input shape |
+| `cpu` | CPU | `yolo11l.pt` in FP32 |
 
-Several workers keep the accelerator busy while others do CPU work, and on Apple Silicon run the GPU and Neural Engine
-at the same time (they only overlap as separate processes). If a worker dies, e.g. a damaged video crashes the decoder,
-its unfinished videos get an error line and a new worker takes over.
+## How it works
 
-Other options: `--model <file>` (model for `cuda`/`mps`/`cpu` workers), `--max-files N`, `--max-rows N` (videos per
-file), `--dev` (one video) and `--fp32` (no FP16 for `.pt` models).
-
-## Checking Correctness
-
-`compare.py` scores a results file against a reference with the three checks below. To check the engine against full-precision PyTorch:
-
-```sh
-python run.py --input <folder> --output reference.jsonl --model yolo/yolo11l.pt --fp32 --max-rows 5
-python run.py --input <folder> --output engine.jsonl --max-rows 5
-python compare.py reference.jsonl engine.jsonl
+```text
+main process                       worker process (one per --workers entry)
+------------                       -----------------------------------------
+read Parquet rows  --- video --->  decoder thread: decode, rotate, resize ---> frames
+write result lines <--- lines ---  main thread:    batch, pad + normalise on device, YOLO, NMS, per-second results
 ```
 
-## Output Format
+1. **Reading.** The main process streams each Parquet file one row at a time and puts every video on a task queue.
+   A file that cannot be read gets an error line for the row it failed on.
+2. **Decoding** (worker, background thread). PyAV decodes each frame to BGR, applies the rotation tag, and assigns
+   the frame to second `floor((pts - first_pts) * time_base)`. Frames that need resizing for the letterbox are resized
+   here with the same OpenCV call Ultralytics uses, so the model thread never waits for it.
+3. **Inference** (worker, main thread). Frames of the same size are batched (up to 64, across seconds) and padded,
+   converted to RGB and normalised on the device, then run through the model and Ultralytics' own
+   `non_max_suppression`. This is exactly what `YOLO.predict` does, step for step, without its per-call overhead:
+   the output is byte-identical. CoreML workers pad on the CPU and hand the Neural Engine uint8 images directly,
+   which are the same pixels Ultralytics' CoreML backend would rebuild from the normalised tensor.
+4. **Results.** A second's line is written once all its frames are scored. Each worker sends its lines to the main
+   process, which writes the single output file. The main process ends the run: once every video it fed is finished,
+   it tells each worker to stop.
+5. **Failures.** A video that fails to decode keeps the lines already written and gets one error line. If a worker
+   process dies (for example the decoder crashes on a damaged file), its unfinished videos get error lines and a new
+   worker takes over.
+
+### Model settings
+
+As the brief requires: input size 640 with Ultralytics' minimal ("rect") letterbox, confidence 0.4, class-aware NMS
+with IoU 0.7 (set explicitly: Ultralytics 8.4 `predict` otherwise falls back to 0.5), BGR frames, and rotation tags
+applied. Detection runs only for the five classes.
+
+### Why it is fast
+
+- **No per-call overhead.** Padding and normalisation run on the device; the model and NMS are called directly.
+- **Overlapped work.** Decoding and resizing run in a thread alongside inference, and several worker processes keep
+  the accelerator busy while others do CPU work.
+- **FP16 everywhere.** TensorRT FP16 on NVIDIA (optimised for the most common batch, 64 frames at 384x640), FP16
+  PyTorch on Apple GPUs, FP16 CoreML on the Neural Engine.
+- **Apple GPU and Neural Engine together.** They only run in parallel from separate processes, hence the
+  `mps,mps,coreml,coreml` default. CoreML models are static, so there is one per letterbox shape, which keeps the
+  padding identical to the `.pt` model.
+- **Pinned memory on CUDA.** Frames are stacked straight into a reusable page-locked buffer and copied to the GPU
+  asynchronously.
+
+## Checking correctness
+
+`compare.py` scores a results file against a reference with the brief's three checks and exits non-zero on failure.
+To check the fast path against full-precision PyTorch on a few videos:
+
+```sh
+python run.py --input <folder> --output reference.jsonl --workers cpu --max-rows 3        # or --workers cuda --model yolo/yolo11l.pt --fp32
+python run.py --input <folder> --output fast.jsonl --max-rows 3
+python compare.py reference.jsonl fast.jsonl
+```
+
+## Output format
+
+One JSON line per second of each video, in no particular order:
 
 ```jsonl
-{"video": "train-00003-of-01357.parquet:4", "second": 12, "objects": ["person", "laptop"], "people":
-2}
+{"video": "train-00003-of-01357.parquet:4", "second": 12, "objects": ["person", "laptop"], "people": 2}
 {"video": "train-00003-of-01357.parquet:4", "second": 13, "objects": [], "people": 0}
 {"video": "train-00003-of-01357.parquet:5", "error": "could not decode video"}
 ```
 
 - `video` is the Parquet file name without its folder, a colon, and the row number in that file, counting from 0.
-- Second 12 holds the frames whose timestamp is at least 12.0 and below 13.0 seconds, counted from the first decoded frame of the video.
-- There is a line for every second up to and including the second that holds the last frame. A second with nothing found has an empty list and "people": 0.
-- Object names are exactly `person, car, dog, laptop, cell phone`. They are irrespective of order.
-- If a video can't be processed at any point, there exists an error message `could not decode video`. earlier seconds are already logged, after failure that video is aborted.
+- Second 12 holds the frames whose timestamp is at least 12.0 and below 13.0 seconds, counted from the first decoded
+  frame of the video. Every second up to and including the one that holds the last frame has a line.
+- An object is listed if the model finds it in at least half of that second's frames.
+- `people` is the median number of people found per frame in that second, rounded down when it falls halfway.
+- A video that cannot be processed gets one error line; seconds already written for it are kept.
 
-## Detection Criteria
+## Files
 
-- An object is present in a second if the model finds it in at least half of that second's frames.
-- The people count for a second is the median of the number of people found in each frame of that second, rounded down when it falls halfway between two numbers.
-
-## Testing Criteria (as per Alethia)
-
-- Objects must have an F1 score of at least 0.95 against the reference.
-- People count must match the reference exactly on at least 85% of seconds.
-- People count must be within 1 of the reference on at least 95% of seconds.
-- The test set is about 13 hours of FineVideo video in the same Parquet format, Some test files may be damaged or unusual. Total test runtime must be less than 6 hours on NVIDIA RTX 4090 with 24 GB of memory, 32 thread CPU with 64 GB of RAM with Ubuntu 22.04, Python 3.11, and an NVIDIA driver that supports CUDA 12. Some test files may be damaged or unusual.
+| File | Purpose |
+| --- | --- |
+| `run.py` | The pipeline |
+| `build_engine.py` | Builds the TensorRT FP16 engine (preparation command) |
+| `compare.py` | Scores results against a reference |
+| `OPTIMISATION_LOG.md` | Every optimisation tried, in order, with measurements |
+| `requirements.in` | Direct dependencies; `requirements.txt` is generated from it (command at its top) |
