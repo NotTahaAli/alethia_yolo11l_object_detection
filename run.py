@@ -2,21 +2,31 @@
 
     python run.py --input <folder of .parquet files> --output results.jsonl
 
-A background thread decodes videos into BGR frames and pushes them onto a bounded queue. The main thread
-batches frames (across seconds of the same video) through YOLO and writes one JSON line per second.
+The main process reads the Parquet files and hands each video to a pool of worker processes. Each worker runs one
+inference backend (CUDA, MPS, CoreML or CPU); inside a worker a thread decodes videos into BGR frames while the main
+thread batches them through YOLO. Workers send result lines back and the main process writes them to one file.
+If a worker process dies (e.g. a damaged video crashes the decoder), its unfinished videos get error lines and a
+replacement worker is started.
 """
 import argparse
+import functools
 import io
 import json
+import multiprocessing as mp
 import os
 import queue
+import shutil
 import statistics
+import tempfile
 import threading
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from multiprocessing.process import BaseProcess
+from multiprocessing.queues import Queue as MpQueue
+from multiprocessing.synchronize import Event as MpEvent
 from time import time
-from typing import TextIO, TypeAlias
+from typing import Literal, TypeAlias
 
 import av
 import numpy as np
@@ -25,67 +35,71 @@ import torch
 from av.video.frame import VideoFrame
 from numpy.typing import NDArray
 from ultralytics import YOLO
+from ultralytics.data.augment import LetterBox
 from ultralytics.engine.results import Results
 
 PT_MODEL_FILE = "yolo/yolo11l.pt"
 ENGINE_MODEL_FILE = "yolo/yolo11l.engine"  # built by build_engine.py
+COREML_DIR = "yolo/coreml"  # CoreML models, one per letterboxed input shape, exported on first use
 MODEL_INPUT_SIZE = 640
+MODEL_STRIDE = 32
 MODEL_CONFIDENCE_THRESHOLD = 0.4
 OBJECT_DETECTION_CLASSES = ("person", "car", "dog", "laptop", "cell phone")
 # Frames per model call. The TensorRT engine is built with this as its max batch, so keep them in sync.
 BATCH_SIZE = 64
-QUEUE_SIZE = 4 * BATCH_SIZE  # decoded frames buffered ahead of the model
+FRAME_QUEUE_SIZE = 4 * BATCH_SIZE  # decoded frames buffered ahead of the model, per worker
 ERROR_MESSAGE = "could not decode video"
 
 Image: TypeAlias = NDArray[np.uint8]
+Backend: TypeAlias = Literal["cuda", "mps", "coreml", "cpu"]
+BACKENDS: tuple[Backend, ...] = ("cuda", "mps", "coreml", "cpu")
+Shape: TypeAlias = tuple[int, int]
 
 
-# Events sent from the decoder thread to the main thread, in decode order.
-@dataclass(frozen=True, slots=True)
-class DecodedFrame:
-    video: str
-    second: int
-    image: Image
+# ---------------------------------------------------------------------------------------------------------------------
+# Inference
 
 
-@dataclass(frozen=True, slots=True)
-class SecondEnd:
-    video: str
-    second: int
-    frame_count: int
+@functools.lru_cache(maxsize=None)
+def letterbox_shape(height: int, width: int) -> Shape:
+    """Model input shape Ultralytics' minimal ("rect") letterbox gives a .pt model for a frame of this size."""
+    padded = LetterBox(MODEL_INPUT_SIZE, auto=True, stride=MODEL_STRIDE)(image=np.zeros((height, width, 3), np.uint8))
+    if not isinstance(padded, np.ndarray):
+        raise TypeError(f"LetterBox returned {type(padded).__name__}")
+    return padded.shape[0], padded.shape[1]
 
 
-@dataclass(frozen=True, slots=True)
-class VideoFailed:
-    video: str
-
-
-@dataclass(frozen=True, slots=True)
-class DecodingDone:
-    crash: BaseException | None = None  # set if the decoder thread itself died
-
-
-Event = DecodedFrame | SecondEnd | VideoFailed | DecodingDone
-
-
-def pick_device() -> str:
-    if torch.cuda.is_available():
-        return "0"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
-def default_model(device: str) -> str:
-    return ENGINE_MODEL_FILE if device == "0" and os.path.exists(ENGINE_MODEL_FILE) else PT_MODEL_FILE
+def coreml_model(shape: Shape) -> str:
+    """Path of the FP16 CoreML model for this input shape, exporting it on first use.
+    A static model at exactly the rect shape letterboxes identically to the .pt model."""
+    path = os.path.join(COREML_DIR, f"yolo11l_{shape[0]}x{shape[1]}.mlpackage")
+    if os.path.exists(path):
+        return path
+    os.makedirs(COREML_DIR, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=COREML_DIR) as tmp:  # export privately, then rename: safe across workers
+        pt_copy = shutil.copy(PT_MODEL_FILE, tmp)
+        exported = YOLO(pt_copy, task="detect").export(format="coreml", imgsz=shape, quantize=16, nms=False)
+        try:
+            os.rename(str(exported), path)
+        except OSError:
+            if not os.path.exists(path):  # lost a race to another worker otherwise
+                raise
+    return path
 
 
 class Predictor:
-    def __init__(self, model_file: str, device: str, fp16: bool):
-        self.device = device
-        self.fp16 = fp16
-        self.model = YOLO(model_file, task="detect")
-        names: dict[int, str] = self.model.names
+    def __init__(self, backend: Backend, model_file: str | None, fp16: bool):
+        self.backend = backend
+        self.device = {"cuda": "0", "mps": "mps", "coreml": "cpu", "cpu": "cpu"}[backend]
+        self.fp16 = fp16 and backend in ("cuda", "mps")
+        self.models: dict[Shape, YOLO] = {}  # CoreML: one model per input shape
+        if backend == "coreml":
+            self.model_file = "CoreML"
+        else:
+            self.model_file = model_file or (ENGINE_MODEL_FILE if backend == "cuda" and os.path.exists(ENGINE_MODEL_FILE)
+                                             else PT_MODEL_FILE)
+            self.model = YOLO(self.model_file, task="detect")
+        names: dict[int, str] = YOLO(PT_MODEL_FILE, task="detect").names if backend == "coreml" else self.model.names
         name_to_id = {name: class_id for class_id, name in names.items()}
         missing = [name for name in OBJECT_DETECTION_CLASSES if name not in name_to_id]
         if missing:
@@ -93,15 +107,24 @@ class Predictor:
         self.names = names
         self.class_ids = [name_to_id[name] for name in OBJECT_DETECTION_CLASSES]
 
+    def _model_for(self, image: Image) -> tuple[YOLO, int | Shape]:
+        if self.backend != "coreml":
+            return self.model, MODEL_INPUT_SIZE
+        shape = letterbox_shape(image.shape[0], image.shape[1])
+        if shape not in self.models:
+            self.models[shape] = YOLO(coreml_model(shape), task="detect")
+        return self.models[shape], shape
+
     def predict(self, images: list[Image]) -> list[tuple[set[str], int]]:
-        """Return (objects found, people count) for each image."""
-        results = self.model.predict(images,
-                                     imgsz=MODEL_INPUT_SIZE,
-                                     conf=MODEL_CONFIDENCE_THRESHOLD,
-                                     classes=self.class_ids,
-                                     quantize=16 if self.fp16 else None,  # .pt only; an engine has its own precision
-                                     verbose=False,
-                                     device=self.device)
+        """Return (objects found, people count) for each image. All images must have the same shape."""
+        model, imgsz = self._model_for(images[0])
+        results = model.predict(images,
+                                imgsz=imgsz,
+                                conf=MODEL_CONFIDENCE_THRESHOLD,
+                                classes=self.class_ids,
+                                quantize=16 if self.fp16 else None,  # .pt only; engines and CoreML set their own
+                                verbose=False,
+                                device=self.device)
         detections: list[tuple[set[str], int]] = []
         for result in results:
             if not isinstance(result, Results):
@@ -110,6 +133,10 @@ class Predictor:
             names = [self.names[class_id] for class_id in class_ids]
             detections.append((set(names), names.count("person")))
         return detections
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Decoding
 
 
 def to_bgr(frame: VideoFrame) -> Image:
@@ -143,45 +170,80 @@ def decode_video(video_bytes: bytes) -> Iterator[tuple[int, Image | None]]:
         yield current_second, None
 
 
-def iter_videos(parquet_file: str, max_rows: int) -> Iterator[tuple[int, object]]:
-    """Yield (row index, mp4 cell), one row at a time so a whole file never sits in memory."""
-    batches = pq.ParquetFile(parquet_file).iter_batches(batch_size=1, columns=["mp4"])
-    for row_index, batch in enumerate(batches):
-        if 0 < max_rows <= row_index:
-            return
-        yield row_index, batch.column(0)[0].as_py()
+# ---------------------------------------------------------------------------------------------------------------------
+# Messages. Main process -> workers: VideoTask. Worker decoder thread -> worker main thread: the frame events.
+# Workers -> main process: WorkerReady, VideoStarted, ResultLine, VideoFinished, WorkerExited.
 
 
-def decode_all(parquet_files: list[str], max_rows: int, events: "queue.Queue[Event]") -> None:
-    """Decoder thread: turn every video into events. Never lets an exception escape."""
-    try:
-        for parquet_file in parquet_files:
-            name = os.path.basename(parquet_file)
-            row_index = 0
-            try:
-                for row_index, video_bytes in iter_videos(parquet_file, max_rows):
-                    video = f"{name}:{row_index}"
-                    print(f"Decoding {video}")
-                    frame_count = 0
-                    try:
-                        if not isinstance(video_bytes, bytes):  # pyarrow is untyped: check the boundary at runtime
-                            raise TypeError(f"mp4 cell holds {type(video_bytes).__name__}, not bytes")
-                        for second, image in decode_video(video_bytes):
-                            if image is None:
-                                events.put(SecondEnd(video, second, frame_count))
-                                frame_count = 0
-                            else:
-                                events.put(DecodedFrame(video, second, image))
-                                frame_count += 1
-                    except Exception as e:
-                        print(f"Error decoding {video}: {e}")
-                        events.put(VideoFailed(video))
-            except Exception as e:  # unreadable or damaged parquet file: blame the row we were on
-                print(f"Error reading {parquet_file}: {e}")
-                events.put(VideoFailed(f"{name}:{row_index}"))
-        events.put(DecodingDone())
-    except BaseException as e:
-        events.put(DecodingDone(crash=e))
+@dataclass(frozen=True, slots=True)
+class VideoTask:
+    video: str  # "<parquet file name>:<row>"
+    data: object  # the mp4 cell; checked to be bytes by the worker
+
+
+@dataclass(frozen=True, slots=True)
+class DecodedFrame:
+    video: str
+    second: int
+    image: Image
+
+
+@dataclass(frozen=True, slots=True)
+class SecondEnd:
+    video: str
+    second: int
+    frame_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class VideoEnd:
+    video: str
+    failed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DecodingDone:
+    crash: BaseException | None = None  # set if the decoder thread itself died
+
+
+FrameEvent: TypeAlias = DecodedFrame | SecondEnd | VideoEnd | DecodingDone
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerReady:
+    worker: int
+    description: str
+
+
+@dataclass(frozen=True, slots=True)
+class VideoStarted:
+    worker: int
+    video: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResultLine:
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class VideoFinished:
+    worker: int
+    video: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerExited:
+    worker: int
+
+
+WorkerMessage: TypeAlias = WorkerReady | VideoStarted | ResultLine | VideoFinished | WorkerExited
+TaskQueue: TypeAlias = "MpQueue[VideoTask]"
+ResultQueue: TypeAlias = "MpQueue[WorkerMessage]"
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Worker process
 
 
 @dataclass(slots=True)
@@ -193,14 +255,11 @@ class SecondStats:
 
 
 class ResultWriter:
-    """Aggregates per-frame detections into per-second lines, writing each second once all its frames are in."""
+    """Aggregates per-frame detections into per-second lines, emitting each second once all its frames are in."""
 
-    def __init__(self, out: TextIO):
-        self.out = out
+    def __init__(self, emit: Callable[[str], None]):
+        self.emit = emit
         self.pending: dict[tuple[str, int], SecondStats] = {}
-
-    def _write(self, line: dict[str, object]) -> None:
-        self.out.write(json.dumps(line) + "\n")
 
     def add_detections(self, frames: list[DecodedFrame], detections: list[tuple[set[str], int]]) -> None:
         touched: set[tuple[str, int]] = set()
@@ -212,14 +271,14 @@ class ResultWriter:
             stats.people.append(people)
             touched.add(key)
         for key in touched:
-            self._write_if_complete(key)
+            self._emit_if_complete(key)
 
     def end_second(self, event: SecondEnd) -> None:
         key = (event.video, event.second)
         self.pending.setdefault(key, SecondStats()).frame_count = event.frame_count
-        self._write_if_complete(key)
+        self._emit_if_complete(key)
 
-    def _write_if_complete(self, key: tuple[str, int]) -> None:
+    def _emit_if_complete(self, key: tuple[str, int]) -> None:
         stats = self.pending[key]
         if stats.frame_count is None or stats.frames_done < stats.frame_count:
             return
@@ -227,50 +286,95 @@ class ResultWriter:
         n = stats.frame_count
         objects = [name for name in OBJECT_DETECTION_CLASSES if n and stats.object_frames[name] >= n / 2]
         people = int(statistics.median(stats.people)) if stats.people else 0  # int() rounds a .5 median down
-        self._write({"video": key[0], "second": key[1], "objects": objects, "people": people})
+        self.emit(json.dumps({"video": key[0], "second": key[1], "objects": objects, "people": people}))
 
     def fail_video(self, video: str) -> None:
-        """Drop the unfinished seconds of a failed video and write its error line. Call after flushing the batch."""
+        """Drop the unfinished seconds of a failed video and emit its error line. Call after flushing the batch."""
         for key in [k for k in self.pending if k[0] == video]:
             del self.pending[key]
-        self._write({"video": video, "error": ERROR_MESSAGE})
+        self.emit(error_line(video))
 
 
-def run(parquet_files: list[str], output_file: str, predictor: Predictor, max_rows: int) -> None:
-    events: queue.Queue[Event] = queue.Queue(maxsize=QUEUE_SIZE)
-    decoder = threading.Thread(target=decode_all, args=(parquet_files, max_rows, events), daemon=True)
+def error_line(video: str) -> str:
+    return json.dumps({"video": video, "error": ERROR_MESSAGE})
+
+
+def decode_tasks(worker: int, tasks: TaskQueue, all_fed: MpEvent, results: ResultQueue,
+                 events: "queue.Queue[FrameEvent]") -> None:
+    """Worker decoder thread: pull videos until the main process has fed them all, turn each into frame events."""
+    try:
+        while True:
+            try:
+                task = tasks.get(timeout=0.5)
+            except queue.Empty:
+                if all_fed.is_set() and tasks.empty():
+                    break
+                continue
+            results.put(VideoStarted(worker, task.video))
+            frame_count = 0
+            try:
+                if not isinstance(task.data, bytes):  # pyarrow is untyped: check the boundary at runtime
+                    raise TypeError(f"mp4 cell holds {type(task.data).__name__}, not bytes")
+                for second, image in decode_video(task.data):
+                    if image is None:
+                        events.put(SecondEnd(task.video, second, frame_count))
+                        frame_count = 0
+                    else:
+                        events.put(DecodedFrame(task.video, second, image))
+                        frame_count += 1
+                events.put(VideoEnd(task.video, failed=False))
+            except Exception as e:
+                print(f"Error decoding {task.video}: {e}", flush=True)
+                events.put(VideoEnd(task.video, failed=True))
+        events.put(DecodingDone())
+    except BaseException as e:
+        events.put(DecodingDone(crash=e))
+
+
+def worker_main(worker: int, backend: Backend, model_file: str | None, fp16: bool,
+                tasks: TaskQueue, all_fed: MpEvent, results: ResultQueue) -> None:
+    predictor = Predictor(backend, model_file, fp16)
+    results.put(WorkerReady(worker, f"{backend} {predictor.model_file}{' FP16' if predictor.fp16 else ''}"))
+    events: queue.Queue[FrameEvent] = queue.Queue(maxsize=FRAME_QUEUE_SIZE)
+    decoder = threading.Thread(target=decode_tasks, args=(worker, tasks, all_fed, results, events), daemon=True)
     decoder.start()
 
-    with open(output_file, "w") as out:
-        writer = ResultWriter(out)
-        batch: list[DecodedFrame] = []
+    writer = ResultWriter(lambda text: results.put(ResultLine(text)))
+    batch: list[DecodedFrame] = []
 
-        def flush() -> None:
-            if batch:
-                writer.add_detections(batch, predictor.predict([f.image for f in batch]))
-                batch.clear()
+    def flush() -> None:
+        if batch:
+            writer.add_detections(batch, predictor.predict([f.image for f in batch]))
+            batch.clear()
 
-        while True:
-            event = events.get()
-            match event:
-                case DecodedFrame():
-                    # Same-shape batches keep Ultralytics' minimal letterbox, matching single-video inference.
-                    if batch and batch[0].image.shape != event.image.shape:
-                        flush()
-                    batch.append(event)
-                    if len(batch) >= BATCH_SIZE:
-                        flush()
-                case SecondEnd():
-                    writer.end_second(event)
-                case VideoFailed():
+    while True:
+        event = events.get()
+        match event:
+            case DecodedFrame():
+                # Same-shape batches keep Ultralytics' minimal letterbox, matching single-video inference.
+                if batch and batch[0].image.shape != event.image.shape:
                     flush()
-                    writer.fail_video(event.video)
-                case DecodingDone(crash=crash):
+                batch.append(event)
+                if len(batch) >= BATCH_SIZE:
                     flush()
-                    if crash is not None:
-                        raise crash
-                    break
+            case SecondEnd():
+                writer.end_second(event)
+            case VideoEnd(video=video, failed=failed):
+                flush()  # every second of this video is now complete
+                if failed:
+                    writer.fail_video(video)
+                results.put(VideoFinished(worker, video))
+            case DecodingDone(crash=crash):
+                flush()
+                if crash is not None:
+                    raise crash
+                break
     decoder.join()
+    results.put(WorkerExited(worker))
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Main process
 
 
 def get_parquet_files(folder_path: str, max_files: int) -> list[str]:
@@ -280,25 +384,132 @@ def get_parquet_files(folder_path: str, max_files: int) -> list[str]:
     return files[:max_files] if max_files > 0 else files
 
 
+def feed_tasks(parquet_files: list[str], max_rows: int, tasks: TaskQueue, all_fed: MpEvent,
+               write: Callable[[str], None]) -> None:
+    """Reader thread: put every video on the task queue. Unreadable files get an error line for the row they broke on."""
+    try:
+        for parquet_file in parquet_files:
+            name = os.path.basename(parquet_file)
+            row_index = 0
+            try:
+                batches = pq.ParquetFile(parquet_file).iter_batches(batch_size=1, columns=["mp4"])
+                for row_index, batch in enumerate(batches):
+                    if 0 < max_rows <= row_index:
+                        break
+                    tasks.put(VideoTask(f"{name}:{row_index}", batch.column(0)[0].as_py()))
+            except Exception as e:
+                print(f"Error reading {parquet_file}: {e}", flush=True)
+                write(error_line(f"{name}:{row_index}"))
+    finally:
+        all_fed.set()
+
+
+def default_backends() -> list[Backend]:
+    if torch.cuda.is_available():
+        return ["cuda", "cuda"]  # one process's CPU pre/post-processing overlaps the other's GPU work
+    if torch.backends.mps.is_available():
+        # Measured on an M5 Pro: the GPU and the Neural Engine run in parallel only as separate processes.
+        return ["mps", "mps", "coreml", "coreml"]
+    return ["cpu"]
+
+
+def run(parquet_files: list[str], output_file: str, backends: list[Backend], model_file: str | None, fp16: bool,
+        max_rows: int) -> None:
+    ctx = mp.get_context("spawn")
+    tasks: TaskQueue = ctx.Queue(maxsize=2 * len(backends))
+    results: ResultQueue = ctx.Queue()
+    all_fed = ctx.Event()
+    lock = threading.Lock()
+
+    with open(output_file, "w") as out:
+        def write(text: str) -> None:
+            with lock:
+                out.write(text + "\n")
+
+        def start(worker: int) -> BaseProcess:
+            process = ctx.Process(target=worker_main, name=f"worker-{worker}",
+                                  args=(worker, backends[worker], model_file, fp16, tasks, all_fed, results))
+            process.start()
+            return process
+
+        processes = {worker: start(worker) for worker in range(len(backends))}
+        ready: set[int] = set()
+        exited: set[int] = set()
+        in_flight: dict[int, set[str]] = {worker: set() for worker in processes}
+        feeder = threading.Thread(target=feed_tasks, args=(parquet_files, max_rows, tasks, all_fed, write), daemon=True)
+        feeder.start()
+
+        def handle(message: WorkerMessage) -> None:
+            match message:
+                case WorkerReady(worker=worker, description=description):
+                    ready.add(worker)
+                    print(f"Worker {worker}: {description}", flush=True)
+                case VideoStarted(worker=worker, video=video):
+                    print(f"Worker {worker}: {video}", flush=True)
+                    in_flight[worker].add(video)
+                case ResultLine(text=text):
+                    write(text)
+                case VideoFinished(worker=worker, video=video):
+                    in_flight[worker].discard(video)
+                case WorkerExited(worker=worker):
+                    exited.add(worker)
+
+        try:
+            while len(exited) < len(processes):
+                try:
+                    handle(results.get(timeout=1))
+                    continue
+                except queue.Empty:
+                    pass
+                for worker, process in processes.items():
+                    if worker in exited or process.is_alive():
+                        continue
+                    while True:  # take everything it sent before dying
+                        try:
+                            handle(results.get_nowait())
+                        except queue.Empty:
+                            break
+                    if worker in exited:
+                        continue
+                    if worker not in ready:
+                        raise RuntimeError(f"Worker {worker} ({backends[worker]}) died during start-up")
+                    for video in sorted(in_flight[worker]):
+                        print(f"Worker {worker} died while processing {video}", flush=True)
+                        write(error_line(video))
+                    in_flight[worker].clear()
+                    ready.discard(worker)
+                    processes[worker] = start(worker)
+        finally:
+            for process in processes.values():
+                if process.is_alive():
+                    process.terminate()
+        feeder.join()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="YOLO11l Object Detection on FineVideo Parquet Files")
     parser.add_argument("--input", required=True, help="Folder containing .parquet files")
     parser.add_argument("--output", default="results.jsonl", help="jsonl file to write the results to")
-    parser.add_argument("--model", help=f"YOLO model file (default: {ENGINE_MODEL_FILE} on CUDA if built, else {PT_MODEL_FILE})")
+    parser.add_argument("--workers", help="Comma-separated backend per worker process, from "
+                        f"{', '.join(BACKENDS)} (default: cuda,cuda on NVIDIA, mps,mps,coreml,coreml on Apple Silicon)")
+    parser.add_argument("--model", help=f"Model file for cuda/mps/cpu workers (default: {ENGINE_MODEL_FILE} on CUDA "
+                        f"if built, else {PT_MODEL_FILE})")
     parser.add_argument("--max-files", type=int, default=0, help="Only process this many parquet files (0 = all)")
     parser.add_argument("--max-rows", type=int, default=0, help="Only process this many videos per file (0 = all)")
     parser.add_argument("--dev", action="store_true", help="Shortcut for --max-files 1 --max-rows 1")
-    parser.add_argument("--fp32", action="store_true", help="Run a .pt model in FP32 (default FP16 on CUDA and MPS), e.g. for a reference")
+    parser.add_argument("--fp32", action="store_true", help="Run .pt models in FP32 (default FP16 on CUDA and MPS)")
     args = parser.parse_args()
     if args.dev:
         args.max_files, args.max_rows = 1, 1
 
-    device = pick_device()
-    model_file: str = args.model or default_model(device)
-    fp16 = device in ("0", "mps") and not args.fp32
-    print(f"Using {model_file} on device {device}{' (FP16)' if fp16 else ''}")
-    predictor = Predictor(model_file, device, fp16)
-    run(get_parquet_files(args.input, args.max_files), args.output, predictor, args.max_rows)
+    backends: list[Backend] = default_backends()
+    if args.workers:
+        names: list[str] = args.workers.split(",")
+        unknown = [n for n in names if n not in BACKENDS]
+        if unknown:
+            parser.error(f"unknown backends {unknown}; choose from {', '.join(BACKENDS)}")
+        backends = [b for n in names for b in BACKENDS if b == n]
+    run(get_parquet_files(args.input, args.max_files), args.output, backends, args.model, not args.fp32, args.max_rows)
 
 
 if __name__ == "__main__":

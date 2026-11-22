@@ -31,9 +31,23 @@ python build_engine.py
 python run.py --input <folder of .parquet files> --output results.jsonl
 ```
 
-On CUDA, `run.py` uses `yolo/yolo11l.engine` if it exists, otherwise `yolo/yolo11l.pt` (FP16). Elsewhere it uses `yolo/yolo11l.pt` in FP32. `--model <file>` overrides this.
+`run.py` reads the Parquet files in the main process and hands each video to a pool of worker processes. Each worker
+runs one backend, decodes in a background thread and runs YOLO on batches of same-shape frames. `--workers` picks the
+backend for each worker, comma-separated:
 
-Development options: `--max-files N`, `--max-rows N` (videos per file), `--dev` (one video) and `--fp32` (no FP16 for the `.pt` model on CUDA).
+| Backend | Model | Default on |
+|---|---|---|
+| `cuda` | `yolo/yolo11l.engine` if built, else `yolo/yolo11l.pt` in FP16 | NVIDIA: `cuda,cuda` |
+| `mps` | `yolo/yolo11l.pt` in FP16 on the Apple GPU | Apple Silicon: `mps,mps,coreml,coreml` |
+| `coreml` | FP16 CoreML models on the Apple Neural Engine, one per letterboxed input shape, exported to `yolo/coreml/` on first use | |
+| `cpu` | `yolo/yolo11l.pt` in FP32 | otherwise |
+
+Several workers keep the accelerator busy while others do CPU work, and on Apple Silicon run the GPU and Neural Engine
+at the same time (they only overlap as separate processes). If a worker dies, e.g. a damaged video crashes the decoder,
+its unfinished videos get an error line and a new worker takes over.
+
+Other options: `--model <file>` (model for `cuda`/`mps`/`cpu` workers), `--max-files N`, `--max-rows N` (videos per
+file), `--dev` (one video) and `--fp32` (no FP16 for `.pt` models).
 
 ## Checking Correctness
 
