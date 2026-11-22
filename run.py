@@ -24,9 +24,8 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue as MpQueue
-from multiprocessing.synchronize import Event as MpEvent
 from time import time
-from typing import Literal, TypeAlias
+from typing import Literal, TextIO, TypeAlias
 
 import av
 import cv2
@@ -289,7 +288,7 @@ class VideoStarted:
 
 @dataclass(frozen=True, slots=True)
 class ResultLine:
-    text: str
+    line: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,7 +303,7 @@ class WorkerExited:
 
 
 WorkerMessage: TypeAlias = WorkerReady | VideoStarted | ResultLine | VideoFinished | WorkerExited
-TaskQueue: TypeAlias = "MpQueue[VideoTask]"
+TaskQueue: TypeAlias = "MpQueue[VideoTask | None]"  # None tells a worker to stop
 ResultQueue: TypeAlias = "MpQueue[WorkerMessage]"
 
 
@@ -365,17 +364,13 @@ def error_line(video: str) -> str:
     return json.dumps({"video": video, "error": ERROR_MESSAGE})
 
 
-def decode_tasks(worker: int, tasks: TaskQueue, all_fed: MpEvent, results: ResultQueue,
+def decode_tasks(worker: int, tasks: TaskQueue, results: ResultQueue,
                  events: "queue.Queue[FrameEvent]") -> None:
-    """Worker decoder thread: pull videos until the main process has fed them all, turn each into frame events."""
+    """Worker decoder thread: turn each video from the task queue into frame events, until told to stop."""
     try:
-        while True:
-            try:
-                task = tasks.get(timeout=0.5)
-            except queue.Empty:
-                if all_fed.is_set() and tasks.empty():
-                    break
-                continue
+        while (task := tasks.get()) is not None:
+            # shortcut: a worker dying between get() and this put() would lose the video and hang the run; only
+            # pure Python runs in between, so this is not guarded
             results.put(VideoStarted(worker, task.video))
             frame_count = 0
             try:
@@ -398,14 +393,14 @@ def decode_tasks(worker: int, tasks: TaskQueue, all_fed: MpEvent, results: Resul
 
 
 def worker_main(worker: int, backend: Backend, model_file: str | None, fp16: bool,
-                tasks: TaskQueue, all_fed: MpEvent, results: ResultQueue) -> None:
+                tasks: TaskQueue, results: ResultQueue) -> None:
     predictor = Predictor(backend, model_file, fp16)
     results.put(WorkerReady(worker, f"{backend} {predictor.model_file}{' FP16' if predictor.fp16 else ''}"))
     events: queue.Queue[FrameEvent] = queue.Queue(maxsize=FRAME_QUEUE_SIZE)
-    decoder = threading.Thread(target=decode_tasks, args=(worker, tasks, all_fed, results, events), daemon=True)
+    decoder = threading.Thread(target=decode_tasks, args=(worker, tasks, results, events), daemon=True)
     decoder.start()
 
-    writer = ResultWriter(lambda text: results.put(ResultLine(text)))
+    writer = ResultWriter(lambda line: results.put(ResultLine(line)))
     batch: list[DecodedFrame] = []
 
     def flush() -> None:
@@ -450,106 +445,134 @@ def get_parquet_files(folder_path: str, max_files: int) -> list[str]:
     return files[:max_files] if max_files > 0 else files
 
 
-def feed_tasks(parquet_files: list[str], max_rows: int, tasks: TaskQueue, all_fed: MpEvent,
-               write: Callable[[str], None]) -> None:
-    """Reader thread: put every video on the task queue. Unreadable files get an error line for the row they broke on."""
-    try:
-        for parquet_file in parquet_files:
-            name = os.path.basename(parquet_file)
-            row_index = 0
-            try:
-                batches = pq.ParquetFile(parquet_file).iter_batches(batch_size=1, columns=["mp4"])
-                for row_index, batch in enumerate(batches):
-                    if 0 < max_rows <= row_index:
-                        break
-                    tasks.put(VideoTask(f"{name}:{row_index}", batch.column(0)[0].as_py()))
-            except Exception as e:
-                print(f"Error reading {parquet_file}: {e}", flush=True)
-                write(error_line(f"{name}:{row_index}"))
-    finally:
-        all_fed.set()
-
-
 def default_backends() -> list[Backend]:
     if torch.cuda.is_available():
-        return ["cuda", "cuda"]  # one process's CPU pre/post-processing overlaps the other's GPU work
+        return ["cuda", "cuda"]  # one process's CPU work overlaps the other's GPU work
     if torch.backends.mps.is_available():
-        # Measured on an M5 Pro: the GPU and the Neural Engine run in parallel only as separate processes.
+        # Measured on an M5 Pro: the GPU and the Neural Engine only run in parallel as separate processes.
         return ["mps", "mps", "coreml", "coreml"]
     return ["cpu"]
 
 
-def run(parquet_files: list[str], output_file: str, backends: list[Backend], model_file: str | None, fp16: bool,
-        max_rows: int) -> None:
-    ctx = mp.get_context("spawn")
-    tasks: TaskQueue = ctx.Queue(maxsize=2 * len(backends))
-    results: ResultQueue = ctx.Queue()
-    all_fed = ctx.Event()
-    lock = threading.Lock()
+class Supervisor:
+    """Feeds videos to worker processes, writes their result lines, and replaces workers that die.
 
-    with open(output_file, "w") as out:
-        def write(text: str) -> None:
-            with lock:
-                out.write(text + "\n")
+    The supervisor alone decides when the run is over: once every video it fed has finished (all its lines, or an
+    error line, written), it sends each worker a stop signal (None on the task queue).
+    """
 
-        def start(worker: int) -> BaseProcess:
-            process = ctx.Process(target=worker_main, name=f"worker-{worker}",
-                                  args=(worker, backends[worker], model_file, fp16, tasks, all_fed, results))
-            process.start()
-            return process
+    def __init__(self, backends: list[Backend], model_file: str | None, fp16: bool, out: TextIO):
+        self.backends = backends
+        self.model_file = model_file
+        self.fp16 = fp16
+        self.out = out
+        self.ctx = mp.get_context("spawn")
+        self.tasks: TaskQueue = self.ctx.Queue(maxsize=2 * len(backends))
+        self.results: ResultQueue = self.ctx.Queue()
+        self.write_lock = threading.Lock()  # the feeder thread writes error lines too
+        self.processes: dict[int, BaseProcess] = {}
+        self.ready: set[int] = set()
+        self.exited: set[int] = set()
+        self.in_flight: dict[int, set[str]] = {}
+        self.fed = 0  # videos put on the task queue; only the feeder thread writes it
+        self.feeding_done = threading.Event()
+        self.finished = 0  # videos fully written
 
-        processes = {worker: start(worker) for worker in range(len(backends))}
-        ready: set[int] = set()
-        exited: set[int] = set()
-        in_flight: dict[int, set[str]] = {worker: set() for worker in processes}
-        feeder = threading.Thread(target=feed_tasks, args=(parquet_files, max_rows, tasks, all_fed, write), daemon=True)
+    def write(self, line: str) -> None:
+        with self.write_lock:
+            self.out.write(line + "\n")
+
+    def run(self, parquet_files: list[str], max_rows: int) -> None:
+        for worker in range(len(self.backends)):
+            self._start(worker)
+        feeder = threading.Thread(target=self._feed, args=(parquet_files, max_rows), daemon=True)
         feeder.start()
-
-        def handle(message: WorkerMessage) -> None:
-            match message:
-                case WorkerReady(worker=worker, description=description):
-                    ready.add(worker)
-                    print(f"Worker {worker}: {description}", flush=True)
-                case VideoStarted(worker=worker, video=video):
-                    print(f"Worker {worker}: {video}", flush=True)
-                    in_flight[worker].add(video)
-                case ResultLine(text=text):
-                    write(text)
-                case VideoFinished(worker=worker, video=video):
-                    in_flight[worker].discard(video)
-                case WorkerExited(worker=worker):
-                    exited.add(worker)
-
+        stopping = False
+        last_check = time()
         try:
-            while len(exited) < len(processes):
+            while len(self.exited) < len(self.processes):
+                if not stopping and self.feeding_done.is_set() and self.finished == self.fed:
+                    for _ in self.processes:
+                        self.tasks.put(None)
+                    stopping = True
                 try:
-                    handle(results.get(timeout=1))
-                    continue
+                    self._handle(self.results.get(timeout=1))
                 except queue.Empty:
                     pass
-                for worker, process in processes.items():
-                    if worker in exited or process.is_alive():
-                        continue
-                    while True:  # take everything it sent before dying
-                        try:
-                            handle(results.get_nowait())
-                        except queue.Empty:
-                            break
-                    if worker in exited:
-                        continue
-                    if worker not in ready:
-                        raise RuntimeError(f"Worker {worker} ({backends[worker]}) died during start-up")
-                    for video in sorted(in_flight[worker]):
-                        print(f"Worker {worker} died while processing {video}", flush=True)
-                        write(error_line(video))
-                    in_flight[worker].clear()
-                    ready.discard(worker)
-                    processes[worker] = start(worker)
+                if time() - last_check >= 1:
+                    self._replace_dead_workers(restart=not stopping)
+                    last_check = time()
         finally:
-            for process in processes.values():
+            for process in self.processes.values():
                 if process.is_alive():
                     process.terminate()
         feeder.join()
+
+    def _start(self, worker: int) -> None:
+        self.in_flight[worker] = set()
+        self.processes[worker] = self.ctx.Process(
+            target=worker_main, name=f"worker-{worker}",
+            args=(worker, self.backends[worker], self.model_file, self.fp16, self.tasks, self.results))
+        self.processes[worker].start()
+
+    def _feed(self, parquet_files: list[str], max_rows: int) -> None:
+        """Feeder thread: put every video on the task queue. A file that cannot be read gets an error line for the
+        row it broke on."""
+        try:
+            for parquet_file in parquet_files:
+                name = os.path.basename(parquet_file)
+                row_index = 0
+                try:
+                    batches = pq.ParquetFile(parquet_file).iter_batches(batch_size=1, columns=["mp4"])
+                    for row_index, batch in enumerate(batches):
+                        if 0 < max_rows <= row_index:
+                            break
+                        self.tasks.put(VideoTask(f"{name}:{row_index}", batch.column(0)[0].as_py()))
+                        self.fed += 1
+                except Exception as e:
+                    print(f"Error reading {parquet_file}: {e}", flush=True)
+                    self.write(error_line(f"{name}:{row_index}"))
+        finally:
+            self.feeding_done.set()
+
+    def _handle(self, message: WorkerMessage) -> None:
+        match message:
+            case WorkerReady(worker=worker, description=description):
+                self.ready.add(worker)
+                print(f"Worker {worker}: {description}", flush=True)
+            case VideoStarted(worker=worker, video=video):
+                print(f"Worker {worker}: {video}", flush=True)
+                self.in_flight[worker].add(video)
+            case ResultLine(line=line):
+                self.write(line)
+            case VideoFinished(worker=worker, video=video):
+                self.in_flight[worker].discard(video)
+                self.finished += 1
+            case WorkerExited(worker=worker):
+                self.exited.add(worker)
+
+    def _replace_dead_workers(self, restart: bool) -> None:
+        for worker, process in list(self.processes.items()):
+            if worker in self.exited or process.is_alive():
+                continue
+            while True:  # take everything it sent before dying
+                try:
+                    self._handle(self.results.get_nowait())
+                except queue.Empty:
+                    break
+            if worker in self.exited:
+                continue
+            if worker not in self.ready:
+                raise RuntimeError(f"Worker {worker} ({self.backends[worker]}) died during start-up")
+            for video in sorted(self.in_flight[worker]):
+                print(f"Worker {worker} died while processing {video}", flush=True)
+                self.write(error_line(video))
+                self.finished += 1
+            self.ready.discard(worker)
+            if restart:
+                self._start(worker)
+            else:  # every video is finished; nothing left for a replacement to do
+                self.exited.add(worker)
 
 
 def main() -> None:
@@ -575,7 +598,9 @@ def main() -> None:
         if unknown:
             parser.error(f"unknown backends {unknown}; choose from {', '.join(BACKENDS)}")
         backends = [b for n in names for b in BACKENDS if b == n]
-    run(get_parquet_files(args.input, args.max_files), args.output, backends, args.model, not args.fp32, args.max_rows)
+    with open(args.output, "w") as out:
+        Supervisor(backends, args.model, not args.fp32, out).run(get_parquet_files(args.input, args.max_files),
+                                                                 args.max_rows)
 
 
 if __name__ == "__main__":
