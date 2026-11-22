@@ -21,7 +21,8 @@ OPT_INPUT_SHAPE = (384, 640)
 
 def main() -> None:
     if not torch.cuda.is_available():
-        raise SystemExit("TensorRT export needs a CUDA GPU.")
+        print("No CUDA GPU: skipping the TensorRT engine; run.py will use the .pt model.")
+        return
     exported = YOLO(PT_MODEL_FILE, task="detect").export(
         format="engine",
         imgsz=OPT_INPUT_SHAPE,
