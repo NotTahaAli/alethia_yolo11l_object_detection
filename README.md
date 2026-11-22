@@ -45,6 +45,7 @@ python run.py --input <folder of .parquet files> --output results.jsonl
 | `--model FILE` | Model for `cuda`, `mps` and `cpu` workers. Default `yolo/yolo11l.engine` on CUDA if built, else `yolo/yolo11l.pt` |
 | `--fp32` | Run `.pt` models in FP32 instead of FP16, e.g. to make a reference |
 | `--max-files N`, `--max-rows N` | Only process the first N Parquet files, or the first N videos of each file |
+| `--sample-rows N`, `--seed S` | Process N randomly chosen videos from every Parquet file; the choice depends only on the seed and file name |
 | `--dev` | Same as `--max-files 1 --max-rows 1` |
 
 | Backend | Runs | Model |
