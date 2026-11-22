@@ -88,6 +88,10 @@ applied. Detection runs only for the five classes.
 
 ### Why it is fast
 
+On an Apple M5 Pro the default runs at about 350 frames per second, 4.2x the first working version, with output
+matching full-precision PyTorch well inside the brief's thresholds. [`OPTIMISATION_LOG.md`](OPTIMISATION_LOG.md) has
+every change that was tried, in order, with measurements.
+
 - **No per-call overhead.** Padding and normalisation run on the device; the model and NMS are called directly.
 - **Overlapped work.** Decoding and resizing run in a thread alongside inference, and several worker processes keep
   the accelerator busy while others do CPU work.

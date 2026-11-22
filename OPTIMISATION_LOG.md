@@ -240,7 +240,32 @@ images directly (`copyMakeBorder` + BGR→RGB) skips two float conversions of th
 
 **Kept.**
 
-## 19. Considered and not done
+## 19. Worker mix, re-tuned with all of the above
+
+10 videos (83,826 frames):
+
+| `--workers` | Time | Throughput |
+|---|---|---|
+| `mps,mps,coreml,coreml` | 238.6 s | 351 fps |
+| `mps,mps,mps,coreml,coreml` | 238.0 s | 352 fps |
+| `mps,mps,coreml,coreml,coreml` | 246.7 s | 340 fps |
+
+All three agree (F1 0.9998). **Kept** `mps,mps,coreml,coreml`: as fast as five workers with one process less.
+Up from 331 fps in step 10, and about 4.2x the starting point (step 1).
+
+## 20. Faster model execution on the Apple GPU
+
+Raw model, batch 64 at 384x640, FP16:
+
+| Variant | Throughput | Output vs standard |
+|---|---|---|
+| standard (contiguous) | 246 fps | |
+| `channels_last` memory format | 149 fps | max abs diff 1.6 |
+| `torch.compile` | 190 fps | max abs diff 2.3 |
+
+**Rejected:** both slower on MPS, and both change the model's numbers.
+
+## 21. Considered and not done
 
 | Idea | Why not |
 |---|---|
