@@ -36,6 +36,7 @@ import torch.nn.functional as F
 import torchvision  # noqa: F401  Ultralytics' NMS uses torchvision's fast kernel only once it is imported
 from av.video.frame import VideoFrame
 from numpy.typing import NDArray
+from PIL import Image as PILImage
 from ultralytics import YOLO
 from ultralytics.data.augment import LetterBox
 from ultralytics.nn.autobackend import AutoBackend
@@ -164,6 +165,29 @@ class Predictor:
         # Reusing the buffer next batch is safe: predict() reads the detections back, which waits for this copy.
         return buffer.to(self.device, non_blocking=True)
 
+    def _run_torch(self, model: AutoBackend, images: list[Image], box: Letterbox) -> torch.Tensor:
+        """Pad and normalise on the device, as Predictor.preprocess does after the letterbox, then run the model."""
+        x = self._upload(images).permute(0, 3, 1, 2)  # BHWC -> BCHW
+        x = F.pad(x, (box.left, box.right, box.top, box.bottom), value=LETTERBOX_PADDING_VALUE)
+        x = x.flip(1)  # BGR -> RGB
+        x = (x.half() if model.fp16 else x.float()).div_(255)
+        return model(x)
+
+    @staticmethod
+    def _run_coreml(model: AutoBackend, images: list[Image], box: Letterbox) -> torch.Tensor:
+        """Ultralytics' CoreML backend turns the normalised tensor back into one uint8 RGB image per request. Build
+        those images directly instead: the same pixels (uint8 -> /255 -> *255 round-trips exactly in float32) without
+        two float conversions of the whole batch. The requests and output handling match the backend's."""
+        requests = [{model.backend.input_name: PILImage.fromarray(cv2.cvtColor(
+            cv2.copyMakeBorder(image, box.top, box.bottom, box.left, box.right, cv2.BORDER_CONSTANT,
+                               value=(LETTERBOX_PADDING_VALUE,) * 3),
+            cv2.COLOR_BGR2RGB))} for image in images]
+        outputs = model.backend.model.predict(requests)
+        arrays = [key for key, value in outputs[0].items() if isinstance(value, np.ndarray)]
+        if len(arrays) != 1:
+            raise ValueError(f"expected one output array from the CoreML model, got {arrays}")
+        return torch.from_numpy(np.concatenate([output[arrays[0]] for output in outputs]))
+
     @torch.inference_mode()
     def predict(self, images: list[Image]) -> list[tuple[set[str], int]]:
         """Return (objects found, people count) for each frame. Frames must share one shape and come from
@@ -172,12 +196,8 @@ class Predictor:
         if box.resized != images[0].shape[:2]:
             raise ValueError(f"frame of shape {images[0].shape} was not resized by prepare_frame")
         model = self._model_for(box.padded)
-
-        x = self._upload(images).permute(0, 3, 1, 2)  # BHWC -> BCHW
-        x = F.pad(x, (box.left, box.right, box.top, box.bottom), value=LETTERBOX_PADDING_VALUE)
-        x = x.flip(1)  # BGR -> RGB
-        x = (x.half() if model.fp16 else x.float()).div_(255)
-        detections = non_max_suppression(model(x), MODEL_CONFIDENCE_THRESHOLD, NMS_IOU_THRESHOLD, self.class_ids,
+        raw = self._run_coreml(model, images, box) if self.backend == "coreml" else self._run_torch(model, images, box)
+        detections = non_max_suppression(raw, MODEL_CONFIDENCE_THRESHOLD, NMS_IOU_THRESHOLD, self.class_ids,
                                           agnostic=False, max_det=MAX_DETECTIONS, nc=0,
                                           end2end=getattr(model, "end2end", False))
         if not (isinstance(detections, list) and all(isinstance(d, torch.Tensor) for d in detections)):
