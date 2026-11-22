@@ -289,6 +289,12 @@ The engine found a person in 11 seconds where the reference found 897; it is eff
 points at its input or build rather than FP16 rounding. Not yet diagnosed. **Rolled back:** the engine is now opt-in
 (`--model yolo/yolo11l.engine`), the preparation command no longer builds it, and CUDA defaults to `yolo11l.pt` in FP16.
 
+The new CUDA default, checked on the same Kaggle T4 and videos:
+
+| Run | Time | vs FP32 reference |
+|---|---|---|
+| `yolo11l.pt` FP16, `cuda,cuda` workers | 324 s (3.1x faster) | object F1 0.9995, people exact 0.9987, within 1 1.0 — PASS |
+
 ## 22. Considered and not done
 
 | Idea | Why not |
