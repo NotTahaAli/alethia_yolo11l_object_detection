@@ -15,8 +15,11 @@ import json
 import multiprocessing as mp
 import os
 import queue
+import random
 import shutil
+import signal
 import statistics
+import sys
 import tempfile
 import threading
 from collections import Counter
@@ -474,6 +477,22 @@ def default_backends() -> list[Backend]:
     return ["cpu"]
 
 
+@dataclass(frozen=True, slots=True)
+class RowSelection:
+    """Which rows of each Parquet file to process: the first `max_rows` (0 = all), then `sample_rows` of those picked
+    at random (0 = all). The sample depends only on the seed and the file name, so runs are reproducible."""
+    max_rows: int = 0
+    sample_rows: int = 0
+    seed: int = 0
+
+    def select(self, file_name: str, num_rows: int) -> list[int]:
+        """Sorted row indices to process."""
+        rows = list(range(min(self.max_rows, num_rows) if self.max_rows > 0 else num_rows))
+        if 0 < self.sample_rows < len(rows):
+            rows = sorted(random.Random(f"{self.seed}:{file_name}").sample(rows, self.sample_rows))
+        return rows
+
+
 class Supervisor:
     """Feeds videos to worker processes, writes their result lines, and replaces workers that die.
 
@@ -502,10 +521,10 @@ class Supervisor:
         with self.write_lock:
             self.out.write(line + "\n")
 
-    def run(self, parquet_files: list[str], max_rows: int) -> None:
+    def run(self, parquet_files: list[str], rows: "RowSelection") -> None:
         for worker in range(len(self.backends)):
             self._start(worker)
-        feeder = threading.Thread(target=self._feed, args=(parquet_files, max_rows), daemon=True)
+        feeder = threading.Thread(target=self._feed, args=(parquet_files, rows), daemon=True)
         feeder.start()
         stopping = False
         last_check = time()
@@ -522,6 +541,10 @@ class Supervisor:
                 if time() - last_check >= 1:
                     self._replace_dead_workers(restart=not stopping)
                     last_check = time()
+        except BaseException:
+            # Interrupted or failed: don't let interpreter exit wait to flush videos no worker will read.
+            self.tasks.cancel_join_thread()
+            raise
         finally:
             for process in self.processes.values():
                 if process.is_alive():
@@ -535,18 +558,22 @@ class Supervisor:
             args=(worker, self.backends[worker], self.model_file, self.fp16, self.tasks, self.results))
         self.processes[worker].start()
 
-    def _feed(self, parquet_files: list[str], max_rows: int) -> None:
-        """Feeder thread: put every video on the task queue. A file that cannot be read gets an error line for the
-        row it broke on."""
+    def _feed(self, parquet_files: list[str], rows: "RowSelection") -> None:
+        """Feeder thread: put the selected videos on the task queue. A file that cannot be read gets an error line for
+        the row it broke on."""
         try:
             for parquet_file in parquet_files:
                 name = os.path.basename(parquet_file)
                 row_index = 0
                 try:
-                    batches = pq.ParquetFile(parquet_file).iter_batches(batch_size=1, columns=["mp4"])
+                    parquet = pq.ParquetFile(parquet_file)
+                    wanted = rows.select(name, parquet.metadata.num_rows)
+                    batches = parquet.iter_batches(batch_size=1, columns=["mp4"])
                     for row_index, batch in enumerate(batches):
-                        if 0 < max_rows <= row_index:
+                        if not wanted or row_index > wanted[-1]:
                             break
+                        if row_index not in wanted:
+                            continue
                         self.tasks.put(VideoTask(f"{name}:{row_index}", batch.column(0)[0].as_py()))
                         self.fed += 1
                 except Exception as e:
@@ -605,9 +632,14 @@ def main() -> None:
                         f"if built, else {PT_MODEL_FILE})")
     parser.add_argument("--max-files", type=int, default=0, help="Only process this many parquet files (0 = all)")
     parser.add_argument("--max-rows", type=int, default=0, help="Only process this many videos per file (0 = all)")
+    parser.add_argument("--sample-rows", type=int, default=0,
+                        help="Process this many randomly chosen videos per file (0 = all), e.g. for a quick spread")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for --sample-rows")
     parser.add_argument("--dev", action="store_true", help="Shortcut for --max-files 1 --max-rows 1")
     parser.add_argument("--fp32", action="store_true", help="Run .pt models in FP32 (default FP16 on CUDA and MPS)")
     args = parser.parse_args()
+    # Treat SIGTERM like Ctrl-C, so workers are stopped instead of left running.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     if args.dev:
         args.max_files, args.max_rows = 1, 1
 
@@ -619,8 +651,8 @@ def main() -> None:
             parser.error(f"unknown backends {unknown}; choose from {', '.join(BACKENDS)}")
         backends = [b for n in names for b in BACKENDS if b == n]
     with open(args.output, "w") as out:
-        Supervisor(backends, args.model, not args.fp32, out).run(get_parquet_files(args.input, args.max_files),
-                                                                 args.max_rows)
+        rows = RowSelection(args.max_rows, args.sample_rows, args.seed)
+        Supervisor(backends, args.model, not args.fp32, out).run(get_parquet_files(args.input, args.max_files), rows)
 
 
 if __name__ == "__main__":
