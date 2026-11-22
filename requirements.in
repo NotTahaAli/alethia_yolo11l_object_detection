@@ -1,7 +1,10 @@
 # Direct dependencies. Regenerate requirements.txt with:
 #   uv pip compile requirements.in --universal --python-version 3.11 --index-strategy unsafe-best-match --emit-index-url -o requirements.txt
 --extra-index-url https://download.pytorch.org/whl/cu126
+# NVIDIA index: the real tensorrt-cu12 wheels (the PyPI ones are download stubs)
+--extra-index-url https://pypi.nvidia.com
 ultralytics==8.4.216
+huggingface-hub==2.4.0  # provides the `hf` CLI for the preparation command
 pyarrow==26.0.1
 av==18.1.1
 numpy==2.3.5
@@ -10,3 +13,7 @@ torch==2.14.1+cu126; sys_platform == "linux"
 torch==2.14.1; sys_platform == "darwin"
 torchvision==0.29.1+cu126; sys_platform == "linux"
 torchvision==0.29.1; sys_platform == "darwin"
+# TensorRT engine build (build_engine.py) and inference, CUDA only. TensorRT 10 builds FP16 with a builder flag;
+# TensorRT 11 would need nvidia-modelopt.
+tensorrt-cu12==10.16.1.11; sys_platform == "linux"
+onnx==1.23.2; sys_platform == "linux"

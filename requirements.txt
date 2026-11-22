@@ -2,9 +2,12 @@
 #    uv pip compile requirements.in --universal --python-version 3.11 --index-strategy unsafe-best-match --emit-index-url -o requirements.txt
 --index-url https://pypi.org/simple
 --extra-index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://pypi.nvidia.com
 
 anyio==4.16.0
-    # via httpx
+    # via
+    #   httpx
+    #   httpx2
 av==18.1.1
     # via -r requirements.in
 certifi==2026.11.20
@@ -14,6 +17,10 @@ certifi==2026.11.20
     #   requests
 charset-normalizer==3.5.2
     # via requests
+click==8.5.1
+    # via huggingface-hub
+colorama==0.4.6 ; sys_platform == 'win32'
+    # via tqdm
 contourpy==1.3.3 ; python_full_version < '3.12'
     # via matplotlib
 contourpy==1.4.0 ; python_full_version >= '3.12'
@@ -27,21 +34,38 @@ cuda-toolkit==12.6.3 ; sys_platform == 'linux'
 cycler==0.12.1
     # via matplotlib
 filelock==4.2.12
-    # via torch
+    # via
+    #   huggingface-hub
+    #   torch
 fonttools==4.68.0
     # via matplotlib
 fsspec==2026.9.0
-    # via torch
+    # via
+    #   huggingface-hub
+    #   torch
 h11==0.16.0
-    # via httpcore
+    # via
+    #   httpcore
+    #   httpcore2
+hf-xet==1.8.0 ; platform_machine == 'AMD64' or platform_machine == 'ARM64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'
+    # via huggingface-hub
 httpcore==1.0.9
     # via httpx
+httpcore2==2.16.2 ; sys_platform != 'emscripten'
+    # via httpx2
 httpx==0.28.1
     # via ultralytics-platform
+httpx2==2.16.2
+    # via huggingface-hub
+httpx2-jsfetch==1.0 ; python_full_version >= '3.12' and sys_platform == 'emscripten'
+    # via httpx2
+huggingface-hub==2.4.0
+    # via -r requirements.in
 idna==3.20
     # via
     #   anyio
     #   httpx
+    #   httpx2
     #   requests
 jinja2==3.1.6
     # via torch
@@ -51,6 +75,8 @@ markupsafe==3.0.4
     # via jinja2
 matplotlib==3.11.2
     # via ultralytics
+ml-dtypes==0.7.0 ; sys_platform == 'linux'
+    # via onnx
 mpmath==1.3.0
     # via sympy
 networkx==3.6.1 ; python_full_version < '3.12'
@@ -62,6 +88,8 @@ numpy==2.3.5
     #   -r requirements.in
     #   contourpy
     #   matplotlib
+    #   ml-dtypes
+    #   onnx
     #   opencv-python
     #   torchvision
     #   ultralytics
@@ -107,10 +135,14 @@ nvidia-nvshmem-cu12==3.4.5 ; sys_platform == 'linux'
     # via torch
 nvidia-nvtx-cu12==12.6.77 ; sys_platform == 'linux'
     # via cuda-toolkit
+onnx==1.23.2 ; sys_platform == 'linux'
+    # via -r requirements.in
 opencv-python==5.1.0.95
     # via ultralytics
 packaging==26.3
-    # via matplotlib
+    # via
+    #   huggingface-hub
+    #   matplotlib
 pillow==13.0.0
     # via
     #   matplotlib
@@ -120,6 +152,8 @@ polars==2.1.0
     # via ultralytics
 polars-runtime-32==2.1.0
     # via polars
+protobuf==7.36.2 ; sys_platform == 'linux'
+    # via onnx
 psutil==7.2.2
     # via ultralytics
 pyarrow==26.0.1
@@ -128,12 +162,20 @@ pyparsing==3.3.3
     # via matplotlib
 python-dateutil==4.0.0
     # via matplotlib
+pyyaml==6.0.4
+    # via huggingface-hub
 requests==2.34.2
     # via ultralytics
 setuptools==84.2.1
     # via torch
 sympy==1.14.0
     # via torch
+tensorrt-cu12==10.16.1.11 ; sys_platform == 'linux'
+    # via -r requirements.in
+tensorrt-cu12-bindings==10.16.1.11 ; sys_platform == 'linux'
+    # via tensorrt-cu12
+tensorrt-cu12-libs==10.16.1.11 ; sys_platform == 'linux'
+    # via tensorrt-cu12
 torch==2.14.1 ; sys_platform == 'darwin'
     # via
     #   -r requirements.in
@@ -164,11 +206,20 @@ torchvision==0.29.2 ; sys_platform != 'darwin' and sys_platform != 'linux'
     # via
     #   -r requirements.in
     #   ultralytics
+tqdm==4.70.1
+    # via huggingface-hub
 triton==3.8.0 ; python_full_version < '3.15' and sys_platform == 'linux'
     # via torch
+truststore==0.10.5 ; sys_platform != 'emscripten'
+    # via
+    #   httpcore2
+    #   httpx2
 typing-extensions==4.16.0
     # via
     #   anyio
+    #   httpx2
+    #   huggingface-hub
+    #   onnx
     #   torch
 tzdata==2026.6
     # via python-dateutil
