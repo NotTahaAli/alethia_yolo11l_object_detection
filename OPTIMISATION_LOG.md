@@ -12,7 +12,7 @@ data point comes from a Kaggle T4. The grader's RTX 4090 was not available, so t
 - *3 videos*: rows 0–2, 1,082 seconds of results, 29,782 frames
 - *10 videos*: rows 0–9, 83,826 frames
 - *damaged fixtures*: a good video, garbage bytes, a null cell, a video cut in half, and a corrupt Parquet file
-- *shape fixtures*: the shortest local video for each of the 17 letterbox input shapes in the first 3 files
+- *shape fixtures*: the shortest local video for each of the 17 letterbox input shapes across all 50 files (1,650 videos)
 
 **Correctness.** `compare.py` scores a run against a reference with the brief's checks: object F1 ≥ 0.95, people
 exact ≥ 85 %, people within 1 ≥ 95 %. The reference is FP32 PyTorch with IoU 0.7 (see step 12).
@@ -203,7 +203,7 @@ build memory. On a Kaggle T4 the old maximum caused many "skipping tactic, insuf
 
 ## 16. Exactness across every input shape
 
-The first 3 local files contain 65 resolutions, which letterbox to 17 model input shapes; 11 of them need a resize.
+The 50 files (1,650 videos) contain 65 resolutions, which letterbox to 17 model input shapes; 11 of them need a resize.
 Ran the shortest video of each shape (1,450 seconds) through both paths.
 
 | Check | Result |
