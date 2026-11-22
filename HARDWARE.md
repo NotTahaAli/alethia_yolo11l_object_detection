@@ -14,9 +14,9 @@
 
 ## Kaggle (For Testing CUDA)
 
-- **Accelerator**: GPU T4 x2
+- **Accelerator**: GPU T4 (Single T4 Used, Second T4 idle)
 - **Disktype**: SSD
 - **Total Run Details**
   - 5 videos of paraquet 00000
   - Time taken: 324 seconds
-- **Full Run Time Estimated**: 26.32 hours
+- **Full Run Time Estimated**: 26.32 hours (Single GPU), 13.5 hours (If Both GPUs Used)
