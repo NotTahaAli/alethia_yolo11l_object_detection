@@ -44,6 +44,8 @@ COREML_DIR = "yolo/coreml"  # CoreML models, one per letterboxed input shape, ex
 MODEL_INPUT_SIZE = 640
 MODEL_STRIDE = 32
 MODEL_CONFIDENCE_THRESHOLD = 0.4
+# The brief's reference uses IoU 0.7. Set it explicitly: Ultralytics 8.4 predict falls back to 0.5 when unset.
+NMS_IOU_THRESHOLD = 0.7
 OBJECT_DETECTION_CLASSES = ("person", "car", "dog", "laptop", "cell phone")
 # Frames per model call. The TensorRT engine is built with this as its max batch, so keep them in sync.
 BATCH_SIZE = 64
@@ -121,6 +123,7 @@ class Predictor:
         results = model.predict(images,
                                 imgsz=imgsz,
                                 conf=MODEL_CONFIDENCE_THRESHOLD,
+                                iou=NMS_IOU_THRESHOLD,
                                 classes=self.class_ids,
                                 quantize=16 if self.fp16 else None,  # .pt only; engines and CoreML set their own
                                 verbose=False,
