@@ -1,7 +1,7 @@
-import math
 from time import time
 from ultralytics import YOLO
 import pyarrow.parquet as pq
+import numpy as np
 import argparse
 import os
 import io
@@ -56,11 +56,19 @@ class Predictor:
                 raise ValueError(f"Class name '{class_name}' not found in the model's class names.")
         return class_ids
 
+    @staticmethod
+    def _to_bgr(frame: VideoFrame) -> np.ndarray:
+        """BGR array with the display-matrix rotation applied (frame.rotation is counter-clockwise degrees)."""
+        image = frame.to_ndarray(format="bgr24")
+        k = (frame.rotation // 90) % 4
+        return np.ascontiguousarray(np.rot90(image, k=k)) if k else image
+
     def predict(self, frames: list[VideoFrame]):
-        return self.model.predict([f.to_ndarray(format="bgr24") for f in frames],
+        return self.model.predict([self._to_bgr(f) for f in frames],
                                   imgsz=self.input_size,
                                   conf=self.confidence_threshold,
                                   classes=self.class_ids,
+                                  quantize=16 if self.device == "0" else None,  # FP16 on CUDA only
                                   verbose=SHOW_VERBOSE_PREDICTIONS,
                                   device=self.device)
 
@@ -87,10 +95,11 @@ def get_parquet_files(folder_path: str) -> list[str]:
 class Logger:
     def __init__(self, output_file: str):
         self.output_file = output_file
+        open(output_file, "w").close()  # start fresh so reruns don't duplicate lines
 
     def _append(self, file: str, row_index: int, data: dict):
         file_name = os.path.basename(file)
-        data["file"] = f"{file_name}:{row_index}"
+        data["video"] = f"{file_name}:{row_index}"
         with open(self.output_file, 'a') as f:
             json.dump(data, f)
             f.write('\n')
@@ -109,88 +118,82 @@ class VideoProcessor:
         self.file = file
         self.row = row
 
-        byte_stream = io.BytesIO(video)
-        self.av_container = av.open(byte_stream, mode='r', format='mp4')
-        self.video = self.av_container.streams.video[0]
-        self.frame_rate = self.video.average_rate
-        self.total_frames = self.video.frames
-        self.duration_seconds = self.total_frames / self.frame_rate
-
     def _save_frame(self, frame: VideoFrame, second: int, frame_index: int):
         if not SAVE_FRAMES:
             return
-        file_base_name = os.path.basename(self.file)
-        output_dir = f"frames/{file_base_name}/row_{self.row}"
+        output_dir = f"frames/{os.path.basename(self.file)}/row_{self.row}"
         os.makedirs(output_dir, exist_ok=True)
-        output_file_path = os.path.join(output_dir, f"second_{second}_frame_{frame_index}.jpg")
-        frame.save(output_file_path)
+        frame.save(os.path.join(output_dir, f"second_{second}_frame_{frame_index}.jpg"))
 
-    def _process_second(self, second: int):
-        start_frame = int(second * self.frame_rate)
-        end_frame = min(int((second + 1) * self.frame_rate), self.total_frames)
-        frame_count = end_frame - start_frame
-        item_counts = {x: 0 for x in OBJECT_DETECTION_CLASSES if x != "person"}
+    def _frames_by_second(self):
+        """Decode the video once and yield (second, frames) for every second, including empty ones.
+        A frame's second is floor((pts - first_pts) * time_base), i.e. counted from the first decoded frame."""
+        with av.open(io.BytesIO(self.video_bytes), mode="r") as container:
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            first_pts = None
+            current_second, frames = 0, []
+            for frame_index, frame in enumerate(container.decode(stream)):
+                if frame.pts is None:
+                    raise ValueError("frame without timestamp")
+                if first_pts is None:
+                    first_pts = frame.pts
+                # ponytail: out-of-order timestamps are folded into the current second
+                second = max(int((frame.pts - first_pts) * frame.time_base), current_second)
+                while second > current_second:
+                    yield current_second, frames
+                    current_second, frames = current_second + 1, []
+                frames.append(frame)
+                self._save_frame(frame, second, frame_index)
+            if first_pts is None:
+                raise ValueError("no frames decoded")
+            yield current_second, frames
+
+    def _process_second(self, second: int, frames: list[VideoFrame]):
+        item_counts = {x: 0 for x in OBJECT_DETECTION_CLASSES}
         people_counts = []
-        frames = []
-        for frame_index in range(start_frame, end_frame):
-            frame = next(self.av_container.decode(video=0))
-            frames.append(frame)
-            self._save_frame(frame, second, frame_index)
-
-        predictions = self.predictor.predict(frames)
-        for result in predictions:
+        for result in self.predictor.predict(frames) if frames else []:
             unique_objects, people_count = self.predictor.evaluate(result)
             for obj in unique_objects:
-                if obj != "person":
-                    item_counts[obj] += 1
+                item_counts[obj] += 1
             people_counts.append(people_count)
 
-        avg_people_count = int(statistics.median(people_counts))
-        objects_detected = [obj for obj, count in item_counts.items() if count >= frame_count / 2]
-        self.logger.log_second(self.file, self.row, second, objects_detected, avg_people_count)
-
+        people = int(statistics.median(people_counts)) if people_counts else 0
+        objects_detected = [obj for obj, count in item_counts.items() if frames and count >= len(frames) / 2]
+        self.logger.log_second(self.file, self.row, second, objects_detected, people)
 
     def process(self):
         print(f"Processing video from file: {self.file}, row: {self.row}")
-        for i in range(math.ceil(self.duration_seconds)):
-            second = i
-            self._process_second(second)
+        for second, frames in self._frames_by_second():
+            self._process_second(second, frames)
+
 class ParquetProcessor:
     def __init__(self, predictor: Predictor, logger: Logger, file_path: str):
         self.predictor = predictor
         self.logger = logger
-        self.table = pq.read_table(file_path)
         self.file_path = file_path
+        self.table = pq.read_table(file_path, columns=["mp4"])
 
     def _get_mp4_count(self) -> int:
-        if self.table.num_rows <= 0:
-            raise ValueError("Number of mp4s cannot be less than 1.")
         if ROWS_TO_PROCESS_PER_FILE > 0 and self.table.num_rows > ROWS_TO_PROCESS_PER_FILE:
             print(f"Limiting to {ROWS_TO_PROCESS_PER_FILE} mp4s for processing.")
             return ROWS_TO_PROCESS_PER_FILE
         return self.table.num_rows
 
-    def _get_video(self, row_index: int) -> bytes:
-        if row_index < 0 or row_index >= self._get_mp4_count():
-            raise IndexError("Row index is out of bounds.")
-        return self.table.column("mp4")[row_index].as_py()
-
     def process(self):
-        mp4_count = self._get_mp4_count()
-        for row_index in range(mp4_count):
+        mp4_column = self.table.column("mp4")
+        for row_index in range(self._get_mp4_count()):
             try:
-                video_bytes = self._get_video(row_index)
-                video_processor = VideoProcessor(self.predictor, self.logger, video_bytes, self.file_path, row_index)
-                video_processor.process()
+                video_bytes = mp4_column[row_index].as_py()
+                VideoProcessor(self.predictor, self.logger, video_bytes, self.file_path, row_index).process()
             except Exception as e:
                 self.logger.log_error(self.file_path, row_index)
                 print(f"Error processing row {row_index}: {e}")
-                break
 
 def main():
     parser = argparse.ArgumentParser(description="YOLO11l Object Detection on FineVideo Parquet Files")
     parser.add_argument("--input", type=str, required=True, help="Folder containing .parquet files")
-    parser.add_argument("--output", type=str, default="results.jsonl", help="jsonl file to append the results to")
+    parser.add_argument("--output", type=str, default="results.jsonl", help="jsonl file to write the results to")
     parser.add_argument("--model", type=str, default=MODEL_FILE, help="Path to the YOLO model file")
     parser.add_argument("--dev", action="store_true", help="Run in development mode with limited files and rows for testing")
 
@@ -210,7 +213,12 @@ def main():
     logger = Logger(output_file)
 
     for file_path in parquet_files:
-        parquet_processor = ParquetProcessor(predictor, logger, file_path)
+        try:
+            parquet_processor = ParquetProcessor(predictor, logger, file_path)
+        except Exception as e:
+            logger.log_error(file_path, 0)
+            print(f"Error reading parquet file {file_path}: {e}")
+            continue
         parquet_processor.process()
 
 if __name__ == "__main__":
