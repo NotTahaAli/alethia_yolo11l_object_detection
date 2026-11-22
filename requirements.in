@@ -17,3 +17,5 @@ torchvision==0.29.1; sys_platform == "darwin"
 # TensorRT 11 would need nvidia-modelopt.
 tensorrt-cu12==10.16.1.11; sys_platform == "linux"
 onnx==1.23.2; sys_platform == "linux"
+# CoreML export and inference for --workers coreml (Apple Neural Engine)
+coremltools==9.0; sys_platform == "darwin"
