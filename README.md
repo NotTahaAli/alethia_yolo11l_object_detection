@@ -88,7 +88,8 @@ applied. Detection runs only for the five classes.
 
 ### Why it is fast
 
-On an Apple M5 Pro the default runs at about 350 frames per second, 4.2x the first working version, with output
+On an Apple M5 Pro the default runs at about 430 frames per second over a whole Parquet file, about 5x the first
+working version, with output
 matching full-precision PyTorch well inside the brief's thresholds. [`OPTIMISATION_LOG.md`](OPTIMISATION_LOG.md) has
 every change that was tried, in order, with measurements.
 

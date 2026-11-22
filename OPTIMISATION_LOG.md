@@ -253,6 +253,17 @@ images directly (`copyMakeBorder` + BGR→RGB) skips two float conversions of th
 All three agree (F1 0.9998). **Kept** `mps,mps,coreml,coreml`: as fast as five workers with one process less.
 Up from 331 fps in step 10, and about 4.2x the starting point (step 1).
 
+A whole Parquet file is a fairer test: with 10 videos, the last long video runs on one worker at the end.
+
+| Test | Time | Throughput |
+|---|---|---|
+| `train-00000` (33 videos, 253,918 frames), `mps,mps,coreml,coreml` | 588 s | 432 fps |
+| `train-00000`, `mps,mps,mps,coreml,coreml` | 598 s | 425 fps (same output, F1 0.9986) |
+| `train-00000`, `mps,mps,coreml,coreml`, batch 32 instead of 64 | 589 s | 431 fps (identical output) |
+
+Neither a fifth worker nor smaller batches help. At 432 fps the 50 files (about 13 M frames) take roughly 8.4 h on
+this Mac.
+
 ## 20. Faster model execution on the Apple GPU
 
 Raw model, batch 64 at 384x640, FP16:
