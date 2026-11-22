@@ -29,14 +29,18 @@ from time import time
 from typing import Literal, TypeAlias
 
 import av
+import cv2
 import numpy as np
 import pyarrow.parquet as pq
 import torch
+import torch.nn.functional as F
+import torchvision  # noqa: F401  Ultralytics' NMS uses torchvision's fast kernel only once it is imported
 from av.video.frame import VideoFrame
 from numpy.typing import NDArray
 from ultralytics import YOLO
 from ultralytics.data.augment import LetterBox
-from ultralytics.engine.results import Results
+from ultralytics.nn.autobackend import AutoBackend
+from ultralytics.utils.nms import non_max_suppression
 
 PT_MODEL_FILE = "yolo/yolo11l.pt"
 ENGINE_MODEL_FILE = "yolo/yolo11l.engine"  # built by build_engine.py
@@ -46,6 +50,8 @@ MODEL_STRIDE = 32
 MODEL_CONFIDENCE_THRESHOLD = 0.4
 # The brief's reference uses IoU 0.7. Set it explicitly: Ultralytics 8.4 predict falls back to 0.5 when unset.
 NMS_IOU_THRESHOLD = 0.7
+MAX_DETECTIONS = 300  # Ultralytics default
+LETTERBOX_PADDING_VALUE = 114  # Ultralytics default
 OBJECT_DETECTION_CLASSES = ("person", "car", "dog", "laptop", "cell phone")
 # Frames per model call. The TensorRT engine is built with this as its max batch, so keep them in sync.
 BATCH_SIZE = 64
@@ -60,15 +66,36 @@ Shape: TypeAlias = tuple[int, int]
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Inference
+#
+# Predictor reproduces what YOLO.predict does for a list of BGR frames, step for step, but cheaper:
+#   letterbox  - Ultralytics' minimal ("rect") letterbox: resize with the same OpenCV call (in the decoder thread, see
+#                prepare_frame), then pad with 114 to a multiple of the stride (on the device instead of the CPU)
+#   normalise  - BHWC uint8 -> BCHW, BGR -> RGB, FP16/FP32, / 255, in the same order as Predictor.preprocess
+#   model      - the same AutoBackend the predictor builds
+#   NMS        - ultralytics.utils.nms.non_max_suppression with the arguments DetectionPredictor.postprocess passes
+# so the model sees identical input and the detections are identical, without YOLO.predict's per-call setup, CPU
+# padding and Results objects.
+
+
+@dataclass(frozen=True, slots=True)
+class Letterbox:
+    """Ultralytics' rect letterbox for one frame size: resize to `resized`, then pad to `padded` (both height, width)."""
+    resized: Shape
+    padded: Shape
+    top: int
+    bottom: int
+    left: int
+    right: int
 
 
 @functools.lru_cache(maxsize=None)
-def letterbox_shape(height: int, width: int) -> Shape:
-    """Model input shape Ultralytics' minimal ("rect") letterbox gives a .pt model for a frame of this size."""
-    padded = LetterBox(MODEL_INPUT_SIZE, auto=True, stride=MODEL_STRIDE)(image=np.zeros((height, width, 3), np.uint8))
-    if not isinstance(padded, np.ndarray):
-        raise TypeError(f"LetterBox returned {type(padded).__name__}")
-    return padded.shape[0], padded.shape[1]
+def letterbox(height: int, width: int) -> Letterbox:
+    params = LetterBox(MODEL_INPUT_SIZE, auto=True, stride=MODEL_STRIDE).get_params(
+        {"img": np.empty((height, width, 3), np.uint8)})
+    new_width, new_height = params["new_unpad"]
+    top, bottom, left, right = params["top"], params["bottom"], params["left"], params["right"]
+    return Letterbox((new_height, new_width), (new_height + top + bottom, new_width + left + right),
+                     top, bottom, left, right)
 
 
 def coreml_model(shape: Shape) -> str:
@@ -90,18 +117,22 @@ def coreml_model(shape: Shape) -> str:
 
 
 class Predictor:
+    """Runs YOLO on batches of same-shape, already resized frames for one backend."""
+
     def __init__(self, backend: Backend, model_file: str | None, fp16: bool):
         self.backend = backend
-        self.device = {"cuda": "0", "mps": "mps", "coreml": "cpu", "cpu": "cpu"}[backend]
-        self.fp16 = fp16 and backend in ("cuda", "mps")
-        self.models: dict[Shape, YOLO] = {}  # CoreML: one model per input shape
+        self.device = torch.device({"cuda": "cuda:0", "mps": "mps", "coreml": "cpu", "cpu": "cpu"}[backend])
+        self.fp16 = fp16 and backend in ("cuda", "mps")  # applies to .pt models; engines and CoreML set their own
+        self.pinned: dict[tuple[int, ...], torch.Tensor] = {}  # CUDA: reusable page-locked upload buffer per shape
+        self.coreml_models: dict[Shape, AutoBackend] = {}  # CoreML: one static model per input shape
         if backend == "coreml":
             self.model_file = "CoreML"
+            model = self._model_for(letterbox(360, 640).padded)  # the most common shape; exported on first run
         else:
             self.model_file = model_file or (ENGINE_MODEL_FILE if backend == "cuda" and os.path.exists(ENGINE_MODEL_FILE)
                                              else PT_MODEL_FILE)
-            self.model = YOLO(self.model_file, task="detect")
-        names: dict[int, str] = YOLO(PT_MODEL_FILE, task="detect").names if backend == "coreml" else self.model.names
+            model = self.model = self._load(self.model_file)
+        names: dict[int, str] = model.names
         name_to_id = {name: class_id for class_id, name in names.items()}
         missing = [name for name in OBJECT_DETECTION_CLASSES if name not in name_to_id]
         if missing:
@@ -109,44 +140,76 @@ class Predictor:
         self.names = names
         self.class_ids = [name_to_id[name] for name in OBJECT_DETECTION_CLASSES]
 
-    def _model_for(self, image: Image) -> tuple[YOLO, int | Shape]:
-        if self.backend != "coreml":
-            return self.model, MODEL_INPUT_SIZE
-        shape = letterbox_shape(image.shape[0], image.shape[1])
-        if shape not in self.models:
-            self.models[shape] = YOLO(coreml_model(shape), task="detect")
-        return self.models[shape], shape
+    def _load(self, path: str) -> AutoBackend:
+        model = AutoBackend(path, device=str(self.device), fp16=self.fp16, verbose=False)
+        model.eval()
+        return model
 
+    def _model_for(self, padded: Shape) -> AutoBackend:
+        if self.backend != "coreml":
+            return self.model
+        if padded not in self.coreml_models:
+            self.coreml_models[padded] = self._load(coreml_model(padded))
+        return self.coreml_models[padded]
+
+    def _upload(self, images: list[Image]) -> torch.Tensor:
+        """Stack the frames into one BHWC uint8 tensor on the device."""
+        if self.device.type != "cuda":
+            return torch.from_numpy(np.stack(images)).to(self.device)
+        # Stack straight into a page-locked buffer so the copy to the GPU is a single asynchronous DMA.
+        shape = images[0].shape
+        if shape not in self.pinned:
+            self.pinned[shape] = torch.empty((BATCH_SIZE, *shape), dtype=torch.uint8).pin_memory()
+        buffer = self.pinned[shape][:len(images)]
+        np.stack(images, out=buffer.numpy())
+        # Reusing the buffer next batch is safe: predict() reads the detections back, which waits for this copy.
+        return buffer.to(self.device, non_blocking=True)
+
+    @torch.inference_mode()
     def predict(self, images: list[Image]) -> list[tuple[set[str], int]]:
-        """Return (objects found, people count) for each image. All images must have the same shape."""
-        model, imgsz = self._model_for(images[0])
-        results = model.predict(images,
-                                imgsz=imgsz,
-                                conf=MODEL_CONFIDENCE_THRESHOLD,
-                                iou=NMS_IOU_THRESHOLD,
-                                classes=self.class_ids,
-                                quantize=16 if self.fp16 else None,  # .pt only; engines and CoreML set their own
-                                verbose=False,
-                                device=self.device)
-        detections: list[tuple[set[str], int]] = []
-        for result in results:
-            if not isinstance(result, Results):
-                raise TypeError(f"unexpected prediction type {type(result)}")
-            class_ids = [int(c) for c in result.boxes.cls.tolist()] if result.boxes is not None else []
-            names = [self.names[class_id] for class_id in class_ids]
-            detections.append((set(names), names.count("person")))
-        return detections
+        """Return (objects found, people count) for each frame. Frames must share one shape and come from
+        prepare_frame, so they are already resized and only need padding."""
+        box = letterbox(images[0].shape[0], images[0].shape[1])
+        if box.resized != images[0].shape[:2]:
+            raise ValueError(f"frame of shape {images[0].shape} was not resized by prepare_frame")
+        model = self._model_for(box.padded)
+
+        x = self._upload(images).permute(0, 3, 1, 2)  # BHWC -> BCHW
+        x = F.pad(x, (box.left, box.right, box.top, box.bottom), value=LETTERBOX_PADDING_VALUE)
+        x = x.flip(1)  # BGR -> RGB
+        x = (x.half() if model.fp16 else x.float()).div_(255)
+        detections = non_max_suppression(model(x), MODEL_CONFIDENCE_THRESHOLD, NMS_IOU_THRESHOLD, self.class_ids,
+                                          agnostic=False, max_det=MAX_DETECTIONS, nc=0,
+                                          end2end=getattr(model, "end2end", False))
+        if not (isinstance(detections, list) and all(isinstance(d, torch.Tensor) for d in detections)):
+            raise TypeError(f"unexpected NMS output {type(detections).__name__}")
+
+        # One transfer for the whole batch: column 5 of each (n, 6) detection tensor is the class id.
+        class_ids: list[int] = torch.cat([d[:, 5] for d in detections]).int().tolist()
+        results: list[tuple[set[str], int]] = []
+        start = 0
+        for d in detections:
+            names = [self.names[class_id] for class_id in class_ids[start:start + len(d)]]
+            start += len(d)
+            results.append((set(names), names.count("person")))
+        return results
 
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Decoding
 
 
-def to_bgr(frame: VideoFrame) -> Image:
-    """BGR array with the display-matrix rotation applied (frame.rotation is counter-clockwise degrees)."""
+def prepare_frame(frame: VideoFrame) -> Image:
+    """BGR array, rotated by the display matrix (frame.rotation is counter-clockwise degrees) and resized for the
+    model with the exact OpenCV call of Ultralytics' letterbox. Runs in the decoder thread, off the inference path."""
     image = np.asarray(frame.to_ndarray(format="bgr24"), dtype=np.uint8)  # bgr24 is uint8; no copy
     k = (frame.rotation // 90) % 4
-    return np.ascontiguousarray(np.rot90(image, k=k)) if k else image
+    if k:
+        image = np.ascontiguousarray(np.rot90(image, k=k))
+    height, width = letterbox(image.shape[0], image.shape[1]).resized
+    if (height, width) != image.shape[:2]:
+        image = np.asarray(cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR), dtype=np.uint8)
+    return image
 
 
 def decode_video(video_bytes: bytes) -> Iterator[tuple[int, Image | None]]:
@@ -167,7 +230,7 @@ def decode_video(video_bytes: bytes) -> Iterator[tuple[int, Image | None]]:
             while second > current_second:
                 yield current_second, None
                 current_second += 1
-            yield second, to_bgr(frame)
+            yield second, prepare_frame(frame)
         if first_pts is None:
             raise ValueError("no frames decoded")
         yield current_second, None
